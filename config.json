@@ -1,7 +1,7 @@
 {
   "conf_threshold": 20,
   "show_masked": false,
-  "view_mode": "denoised",
+  "view_mode": "depth",
   "playback_speed": 30,
   "bilateral_enabled": false,
   "median_enabled": true,
@@ -19,7 +19,7 @@
   "last_session": "20260219_150744",
   "range_min": 0,
   "range_max": 400,
-  "last_frame": 296,
+  "last_frame": 331,
   "gyro_axis_map": "XYZ",
   "ekf_enabled": true,
   "fixed_height_enabled": true,
@@ -49,7 +49,7 @@
     "acc_x_filt": false,
     "acc_y_filt": false,
     "acc_z_filt": false,
-    "gyro_x_filt": true,
+    "gyro_x_filt": false,
     "gyro_y_filt": false,
     "gyro_z_filt": false,
     "vo_score": true
@@ -59,6 +59,6 @@
   "ekf_process_noise": 0.01,
   "max_speed": 1.0,
   "ekf_measure_noise": 1.0,
-  "imu_filter_alpha": 0.34,
+  "imu_filter_alpha": 0.3,
   "fixed_height": 1.0
 }

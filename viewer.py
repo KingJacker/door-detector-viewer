@@ -24,13 +24,17 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QScrollArea,
     QTabWidget,
+    QProgressBar,
 )
-from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtCore import Qt, QEvent, QTimer, QThread
 from PySide6.QtGui import QImage, QPixmap
 
 from vo import VisualOdometry
 from range_slider import RangeSlider
 from ekf import ExtendedKalmanFilter
+from loader import AsyncFrameLoader
+from engine import ProcessingEngine
+from worker import ProcessingWorker
 
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -43,7 +47,6 @@ class DataViewer(QMainWindow):
         self.resize(1600, 900)
 
         self.session_dir = None
-        self.frames = []
         self.imu_data = None
         self.current_frame = 0
         self.current_depth = None
@@ -54,19 +57,14 @@ class DataViewer(QMainWindow):
 
         self.config = self._load_config()
 
-        self.vo = VisualOdometry(self.config)
+        self.frame_loader = AsyncFrameLoader()
+        self.engine = ProcessingEngine(self.config)
+        
         self.vo_results = []
+        
+        # Apply saved EKF parameters to engine's EKF
+        self.engine.update_config(self.config)
 
-        self.ekf = ExtendedKalmanFilter()
-        # Apply saved EKF parameters before UI is created
-        self.ekf.process_noise = self.config.get("ekf_process_noise", 0.1)
-        self.ekf.measurement_noise = self.config.get("ekf_measure_noise", 1.0)
-        self.ekf.fixed_height_enabled = self.config.get("fixed_height_enabled", False)
-        self.ekf.fixed_height = self.config.get("fixed_height", 1.2)
-        self.ekf.height_strength = self.config.get("height_strength", 0.5)
-        self.ekf.max_speed = self.config.get("max_speed", 2.0)
-        self.ekf.lateral_damping = self.config.get("lateral_damping", 0.1)
-        # Apply saved IMU filter alpha
         self.imu_filter_alpha = self.config.get("imu_filter_alpha", 0.8)
         self.imu_filter_enabled = self.config.get("imu_filter_enabled", True)
         self.last_displayed_frame = -1
@@ -76,10 +74,6 @@ class DataViewer(QMainWindow):
         self.map_fused_positions = []  # list of (x, y)
         self.map_depth_points = []  # list of (x, y) — accumulated point cloud
 
-        # Denoised view state
-        self.denoised_depth = None  # float32 buffer (H, W)
-        self.prev_ekf_pos = None
-        self.prev_ekf_R = None
         self.denoise_alpha = 0.3
 
         self.imu_filtered = {
@@ -245,13 +239,12 @@ class DataViewer(QMainWindow):
         splitter.setStretchFactor(2, 1)
         main_layout.addWidget(splitter)
 
-        left_sidebar = self._create_left_sidebar()
-        splitter.addWidget(left_sidebar)
-
         center_widget = self._create_center_panel()
-        splitter.addWidget(center_widget)
-
+        left_sidebar = self._create_left_sidebar()
         right_sidebar = self._create_right_sidebar()
+
+        splitter.addWidget(left_sidebar)
+        splitter.addWidget(center_widget)
         splitter.addWidget(right_sidebar)
 
         splitter.setSizes([250, 900, 300])
@@ -328,6 +321,9 @@ class DataViewer(QMainWindow):
 
         layout.addWidget(series_group)
         layout.addStretch()
+
+        # Sync initial curve visibility
+        self._on_series_toggled()
 
         return widget
 
@@ -590,6 +586,11 @@ class DataViewer(QMainWindow):
         )
         self.vo_stationary_spin.valueChanged.connect(self._on_vo_setting_changed)
         vo_layout.addRow("Stationary (px):", self.vo_stationary_spin)
+
+        self.process_btn = QPushButton("Process Selected Range")
+        self.process_btn.setToolTip("Process the selected frame range in the background.")
+        self.process_btn.clicked.connect(self._on_process_range_clicked)
+        vo_layout.addRow(self.process_btn)
 
         self.vo_layout = vo_layout
         self.vo_rows = list(range(1, vo_layout.rowCount()))
@@ -950,6 +951,10 @@ class DataViewer(QMainWindow):
 
         layout.addWidget(imu_group)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
         layout.addStretch()
 
         scroll.setWidget(widget)
@@ -1000,8 +1005,7 @@ class DataViewer(QMainWindow):
             self.fixed_height_cb.setChecked(False)
             self._on_fixed_height_changed(False)
         if enabled:
-            self.ekf.reset()
-            self._init_ekf_from_imu()
+            self.engine.reset(self.imu_data)
         self.update_display()
 
     def _on_ekf_param_changed(self, param, value):
@@ -1024,22 +1028,21 @@ class DataViewer(QMainWindow):
             self.ekf_measure_noise_spin.setValue(value)
             self.ekf_measure_noise_spin.blockSignals(False)
         self._save_config()
-        # EKF param changes take effect from current frame onwards
-        self.ekf.reset()
-        self._init_ekf_from_imu()
+        self.engine.update_config(self.config)
+        self.engine.reset(self.imu_data)
         self.update_display()
 
     def _on_fixed_height_changed(self, enabled):
-        self.ekf.fixed_height_enabled = enabled
         self.config["fixed_height_enabled"] = enabled
+        self.engine.update_config(self.config)
         self._save_config()
         for row in self.fixed_height_rows:
             self.ekf_layout.setRowVisible(row, enabled)
         self.update_display()
 
     def _on_height_param_changed(self, height_meters):
-        self.ekf.fixed_height = height_meters
         self.config["fixed_height"] = height_meters
+        self.engine.update_config(self.config)
         self._save_config()
         self.fixed_height_slider.blockSignals(True)
         self.fixed_height_slider.setValue(int(height_meters * 100))
@@ -1050,8 +1053,8 @@ class DataViewer(QMainWindow):
         self.update_display()
 
     def _on_height_strength_changed(self, strength):
-        self.ekf.height_strength = strength
         self.config["height_strength"] = strength
+        self.engine.update_config(self.config)
         self._save_config()
         self.height_strength_slider.blockSignals(True)
         self.height_strength_slider.setValue(int(strength * 100))
@@ -1062,14 +1065,14 @@ class DataViewer(QMainWindow):
         self.update_display()
 
     def _on_max_speed_changed(self, value):
-        self.ekf.max_speed = value
         self.config["max_speed"] = value
+        self.engine.update_config(self.config)
         self._save_config()
         self.update_display()
 
     def _on_lateral_damping_changed(self, value):
-        self.ekf.lateral_damping = value
         self.config["lateral_damping"] = value
+        self.engine.update_config(self.config)
         self._save_config()
         self.update_display()
 
@@ -1135,7 +1138,7 @@ class DataViewer(QMainWindow):
         self._save_config()
         for row in self.imu_rows:
             self.imu_layout.setRowVisible(row, enabled)
-        if self.frames:
+        if self.frame_loader.frame_paths:
             self._recompute_imu_filter()
         self.update_display()
 
@@ -1149,23 +1152,20 @@ class DataViewer(QMainWindow):
         self.imu_alpha_spin.blockSignals(True)
         self.imu_alpha_spin.setValue(alpha)
         self.imu_alpha_spin.blockSignals(False)
-        if self.frames:
+        if self.frame_loader.frame_paths:
             self._recompute_imu_filter()
         self.update_display()
 
-    def _init_ekf_from_imu(self):
-        if self.imu_data is not None and len(self.imu_data) > 10:
-            self.ekf.detect_up_direction(self.imu_data)
 
     def _recompute_imu_filter(self):
         alpha = self.imu_filter_alpha
         keys = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
-        n = len(self.frames)
+        num_frames = len(self.frame_loader.frame_paths)
         for key in keys:
             raw = self.imu_interpolated[key]
-            filtered = [0.0] * n
-            prev = raw[0] if n > 0 else 0.0
-            for i in range(n):
+            filtered = [0.0] * num_frames
+            prev = raw[0] if num_frames > 0 else 0.0
+            for i in range(num_frames):
                 val = alpha * raw[i] + (1 - alpha) * prev
                 filtered[i] = val
                 prev = val
@@ -1200,104 +1200,6 @@ class DataViewer(QMainWindow):
         self.map_depth_points.clear()
         self.map_depth_scatter.setData([], [])
 
-    def _compute_denoised(self, depth, conf, conf_threshold):
-        """Motion-compensated temporal depth filter using the EKF pose.
-
-        For each valid pixel in the current frame, the corresponding world point
-        is reprojected into the previous frame using the relative EKF pose, and
-        the previous filtered depth is blended in. This averages the same world
-        point across frames rather than the same pixel, avoiding smearing during
-        camera motion.
-        """
-        H, W = depth.shape
-        f = self.vo.focal_length
-        cx, cy = self.vo.center
-        alpha = self.denoise_alpha
-
-        valid = (conf >= conf_threshold) & (depth > 0)
-        cur_depth_f = depth.astype(np.float32)
-
-        pos_cur = np.array(self.ekf.get_position())
-        R_cur = self.ekf.get_rotation_matrix()
-
-        if self.denoised_depth is None:
-            # First frame: initialize buffer
-            self.denoised_depth = cur_depth_f.copy()
-            self.prev_ekf_pos = pos_cur.copy()
-            self.prev_ekf_R = R_cur.copy()
-            return self.denoised_depth
-
-        prev_pos = self.prev_ekf_pos
-        prev_R = self.prev_ekf_R
-
-        # Relative transform: previous camera frame → current camera frame
-        # P_prev_cam = R_prev^T @ (P_world - pos_prev)
-        # P_cur_cam  = R_cur^T @ (P_world - pos_cur)
-        # So: P_prev_cam = (R_prev^T @ R_cur) @ P_cur_cam + R_prev^T @ (pos_cur - pos_prev)
-        R_rel = prev_R.T @ R_cur  # maps current cam → previous cam
-        t_rel = prev_R.T @ (pos_cur - prev_pos)  # translation in prev cam frame
-
-        # Build pixel coordinate grids for all valid pixels
-        v_idx, u_idx = np.where(valid)
-        if len(u_idx) == 0:
-            self.prev_ekf_pos = pos_cur.copy()
-            self.prev_ekf_R = R_cur.copy()
-            return self.denoised_depth
-
-        d_m = cur_depth_f[v_idx, u_idx] / 1000.0  # mm → m
-
-        # Unproject valid pixels to current camera frame (vectorized)
-        X_cur = (u_idx - cx) / f * d_m
-        Y_cur = (v_idx - cy) / f * d_m
-        Z_cur = d_m
-        pts_cur = np.stack([X_cur, Y_cur, Z_cur], axis=1)  # Nx3
-
-        # Transform to previous camera frame
-        pts_prev = (R_rel @ pts_cur.T).T + t_rel  # Nx3
-
-        # Project to previous pixel coordinates
-        valid_z = pts_prev[:, 2] > 0.01
-        u_prev = np.where(valid_z, f * pts_prev[:, 0] / pts_prev[:, 2] + cx, -1).astype(
-            np.int32
-        )
-        v_prev = np.where(valid_z, f * pts_prev[:, 1] / pts_prev[:, 2] + cy, -1).astype(
-            np.int32
-        )
-
-        # Only blend where the reprojection falls inside the image
-        in_bounds = (
-            valid_z & (u_prev >= 0) & (u_prev < W) & (v_prev >= 0) & (v_prev < H)
-        )
-
-        # Start with current depth as the new denoised buffer
-        new_denoised = self.denoised_depth.copy()
-
-        # Update valid pixels: blend current depth with previous denoised at reprojected coords
-        u_v = u_idx[in_bounds]
-        v_v = v_idx[in_bounds]
-        u_p = u_prev[in_bounds]
-        v_p = v_prev[in_bounds]
-        prev_vals = self.denoised_depth[v_p, u_p]
-        cur_vals = cur_depth_f[v_v, u_v]
-
-        # Only blend where previous buffer had valid data
-        prev_valid = prev_vals > 0
-        new_denoised[v_v[prev_valid], u_v[prev_valid]] = (
-            alpha * cur_vals[prev_valid] + (1 - alpha) * prev_vals[prev_valid]
-        )
-        # For pixels with no previous data, just use current
-        new_denoised[v_v[~prev_valid], u_v[~prev_valid]] = cur_vals[~prev_valid]
-
-        # Pixels not in bounds just keep current depth
-        u_nb = u_idx[~in_bounds]
-        v_nb = v_idx[~in_bounds]
-        new_denoised[v_nb, u_nb] = cur_depth_f[v_nb, u_nb]
-
-        self.denoised_depth = new_denoised
-        self.prev_ekf_pos = pos_cur.copy()
-        self.prev_ekf_R = R_cur.copy()
-
-        return self.denoised_depth
 
     def _update_map(
         self, result, depth, conf, conf_threshold, is_fresh=True, freeze_vo=False
@@ -1332,7 +1234,7 @@ class DataViewer(QMainWindow):
 
         # Fused path
         if self.ekf_enabled_cb.isChecked():
-            fx, fy, _ = self.ekf.get_position()
+            fx, fy, _ = self.engine.ekf.get_position()
             self.map_fused_positions.append((fx, fy))
             if self.map_show_fused_cb.isChecked() and len(self.map_fused_positions) > 1:
                 fxs = [p[0] for p in self.map_fused_positions]
@@ -1350,18 +1252,15 @@ class DataViewer(QMainWindow):
         if self.map_show_pts_cb.isChecked() and is_fresh:
             R_w = result.get("R_world")
             if R_w is not None:
-                f = self.vo.focal_length
-                cx_cam, cy_cam = self.vo.center
-                pos = np.array(
-                    [
-                        result.get("pos_x", 0.0),
-                        result.get("pos_y", 0.0),
-                        result.get("pos_z", 0.0),
-                    ]
-                )
-
                 tracked_pts = result.get("tracked_pts", [])
                 new_world_pts = []
+                f = self.engine.vo.focal_length
+                cx_cam, cy_cam = self.engine.vo.center
+                pos = np.array([
+                    result.get("pos_x", 0.0),
+                    result.get("pos_y", 0.0),
+                    result.get("pos_z", 0.0)
+                ])
                 for pt in tracked_pts:
                     u, v = pt[0], pt[1]
                     iu, iv = int(round(u)), int(round(v))
@@ -1420,7 +1319,7 @@ class DataViewer(QMainWindow):
         self.conf_spin.blockSignals(False)
         self._save_config()
         # Confidence threshold affects VO processing — must recompute
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
 
     def _on_speed_changed(self, value):
@@ -1434,7 +1333,7 @@ class DataViewer(QMainWindow):
         self._save_config()
         self._update_bilateral_params()
         # Bilateral filter now applied to VO data — must recompute
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
 
     def _on_median_toggled(self, checked):
@@ -1442,7 +1341,7 @@ class DataViewer(QMainWindow):
         self._save_config()
         self._update_median_params()
         # Median filter now applied to VO data — must recompute
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
 
     def _on_filter_changed(self):
@@ -1452,7 +1351,7 @@ class DataViewer(QMainWindow):
         self.config["median_k"] = self.median_k.value()
         self._save_config()
         # Filter params affect VO data — must recompute
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
 
     def _update_bilateral_params(self):
@@ -1469,14 +1368,14 @@ class DataViewer(QMainWindow):
         self.config["rejection_threshold"] = self.vo_rejection_spin.value()
         self.config["stationary_threshold"] = self.vo_stationary_spin.value()
         self._save_config()
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
 
     def _on_clahe_toggled(self, checked):
         self.config["clahe_enabled"] = checked
         self._save_config()
         self._update_clahe_params()
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
         for row in self.clahe_rows:
             self.clahe_layout.setRowVisible(row, checked)
@@ -1485,7 +1384,7 @@ class DataViewer(QMainWindow):
         self.config["clahe_clip_limit"] = self.clahe_clip_spin.value() / 10.0
         self.config["clahe_grid_size"] = self.clahe_grid_spin.value()
         self._save_config()
-        self.vo.update_config(self.config)
+        self.engine.update_config(self.config)
         self._recompute_vo()
 
     def _update_clahe_params(self):
@@ -1505,15 +1404,30 @@ class DataViewer(QMainWindow):
         frames_dir = self.session_dir / "frames"
         if not frames_dir.exists():
             return
-        frame_files = sorted(frames_dir.glob("frame_*.npz"))
-        self.frames = [np.load(f) for f in frame_files]
-        if not self.frames:
+            
+        num_frames = self.frame_loader.set_session(frames_dir)
+        if num_frames == 0:
             return
+        
+        # We need a reference to at least one frame to get timestamps if we don't have IMU
+        # but let's assume we can at least get metadata from the loader
+        first_frame = self.frame_loader.get_frame(0)
+        if first_frame is None:
+            return
+        
+        # Get all timestamps for IMU interpolation (this is still a bit heavy but much less than full frames)
+        # Actually, let's just read the timestamps from the filenames or metadata if possible
+        # For now, let's just load the timestamps only.
+        frame_files = sorted(frames_dir.glob("frame_*.npz"))
+        frame_ts = []
+        for f in frame_files:
+            # We can use np.load with mmap_mode to just read the timestamp without loading the whole depth/conf
+            with np.load(f, mmap_mode='r') as data:
+                frame_ts.append(data["timestamp_ns"])
 
         imu_path = self.session_dir / "imu_data.csv"
         if imu_path.exists():
             self.imu_data = np.genfromtxt(imu_path, delimiter=",", skip_header=1)
-            frame_ts = [f["timestamp_ns"] for f in self.frames]
             imu_ts = self.imu_data[:, 0]
 
             for key in ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]:
@@ -1532,21 +1446,16 @@ class DataViewer(QMainWindow):
         else:
             self.imu_data = None
             self.imu_interpolated = {
-                key: [0.0] * len(self.frames)
+                key: [0.0] * num_frames
                 for key in ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
             }
 
-        self.ekf.reset()
-        if self.imu_data is not None and len(self.imu_data) > 10:
-            self.ekf.detect_up_direction(self.imu_data)
+        self.engine.reset(self.imu_data)
 
         # Reset map and denoised state
         self._clear_map()
-        self.denoised_depth = None
-        self.prev_ekf_pos = None
-        self.prev_ekf_R = None
-
-        max_frame = len(self.frames) - 1
+        
+        max_frame = num_frames - 1
         self.slider.setMaximum(max_frame)
         self.range_slider.setRange(0, max_frame)
 
@@ -1569,8 +1478,7 @@ class DataViewer(QMainWindow):
 
         self.view_combo.setCurrentText(self.config.get("view_mode", "depth"))
 
-        self.vo.reset()
-        self.vo_results = [None] * len(self.frames)
+        self.vo_results = [None] * num_frames
         filt_keys = {
             "acc_x_filt",
             "acc_y_filt",
@@ -1583,11 +1491,11 @@ class DataViewer(QMainWindow):
             if key in self.imu_interpolated:
                 self.graph_data[key] = list(self.imu_interpolated[key])
             elif key in filt_keys:
-                self.graph_data[key] = [0.0] * len(self.frames)
+                self.graph_data[key] = [0.0] * num_frames
             elif key in ["pos_fused_x", "pos_fused_y", "pos_fused_z"]:
-                self.graph_data[key] = [0.0] * len(self.frames)
+                self.graph_data[key] = [0.0] * num_frames
             else:
-                self.graph_data[key] = [0] * len(self.frames)
+                self.graph_data[key] = [0] * num_frames
 
         # Must run AFTER graph_data is initialized so filtered series aren't overwritten
         self._recompute_imu_filter()
@@ -1595,18 +1503,14 @@ class DataViewer(QMainWindow):
         self.update_display()
 
     def _recompute_vo(self):
-        if not self.frames:
+        num_frames = len(self.frame_loader.frame_paths)
+        if num_frames == 0:
             return
-        self.vo.reset()
-        self.ekf.reset()
-        self._init_ekf_from_imu()
+        self.engine.reset(self.imu_data)
         self._recompute_imu_filter()
         self._clear_map()
-        self.denoised_depth = None
-        self.prev_ekf_pos = None
-        self.prev_ekf_R = None
         self.last_displayed_frame = -1
-        self.vo_results = [None] * len(self.frames)
+        self.vo_results = [None] * num_frames
         for key in [
             "tracked",
             "rejected",
@@ -1619,9 +1523,9 @@ class DataViewer(QMainWindow):
             "fps",
             "vo_score",
         ]:
-            self.graph_data[key] = [0] * len(self.frames)
+            self.graph_data[key] = [0] * num_frames
         for key in ["pos_fused_x", "pos_fused_y", "pos_fused_z"]:
-            self.graph_data[key] = [0.0] * len(self.frames)
+            self.graph_data[key] = [0.0] * num_frames
         self.update_display()
 
     def slider_moved(self, value):
@@ -1746,30 +1650,36 @@ class DataViewer(QMainWindow):
             self.graph_tooltip.hide()
 
     def _update_graph(self):
-        if not self.graph_data["tracked"]:
+        num_frames = len(self.frame_loader.frame_paths)
+        if num_frames == 0 or not self.graph_data["tracked"]:
             return
 
         min_idx, max_idx = self.range_slider.value()
-        max_idx = min(max_idx, len(self.frames) - 1)
+        max_idx = min(max_idx, num_frames - 1)
         x = list(range(min_idx, max_idx + 1))
 
         for key, curve in self.plot_curves.items():
-            data = self.graph_data[key]
-            data_len = len(data)
-            if data_len == 0:
+            if not curve.isVisible():
                 continue
+            data = self.graph_data.get(key)
+            if data is None or len(data) == 0:
+                continue
+            data_len = len(data)
             slice_end = min(max_idx + 1, data_len)
             data_slice = data[min_idx:slice_end]
+            if not data_slice:
+                continue
             x_slice = list(range(min_idx, min_idx + len(data_slice)))
             data_arr = np.array(data_slice)
-            max_val = data_arr.max() if data_arr.size > 0 and data_arr.max() != 0 else 1
+            max_val = np.abs(data_arr).max() if data_arr.size > 0 and np.abs(data_arr).max() != 0 else 1
             normalized = data_arr / max_val * 100
             curve.setData(x_slice, normalized)
 
         self.playhead_line.setValue(self.current_frame)
 
     def update_display(self):
-        if not self.frames:
+        num_frames = len(self.frame_loader.frame_paths)
+        if num_frames == 0:
             return
 
         # Detect non-sequential frame access (scrubbing) and reset stateful algorithms
@@ -1778,22 +1688,17 @@ class DataViewer(QMainWindow):
             and self.current_frame != self.last_displayed_frame + 1
         )
         if jumped:
-            self.vo.reset()
-            self.ekf.reset()
-            self._init_ekf_from_imu()
-            self.graph_data["pos_fused_x"][self.current_frame] = 0.0
-            self.graph_data["pos_fused_y"][self.current_frame] = 0.0
-            self.graph_data["pos_fused_z"][self.current_frame] = 0.0
-            # Only clear path curves on jump — depth point cloud persists across scrubs
+            self.engine.reset(self.imu_data)
             self._clear_paths()
-            self.denoised_depth = None
-            self.prev_ekf_pos = None
-            self.prev_ekf_R = None
+            
         self.last_displayed_frame = self.current_frame
 
-        frame = self.frames[self.current_frame]
+        frame = self.frame_loader.get_frame(self.current_frame)
+        if frame is None:
+            return
+            
         view_mode = self.view_combo.currentText()
-        conf_threshold = self.config.get("conf_threshold", 100)
+        conf_threshold = self.config.get("conf_threshold", 10)
 
         depth = frame["depth"]
         conf = frame["conf"]
@@ -1801,123 +1706,81 @@ class DataViewer(QMainWindow):
 
         was_cached = self.vo_results[self.current_frame] is not None
 
-        # Compute denoised depth early if needed for VO or display
-        use_denoised_for_vo = (
-            self.vo_use_denoised_cb.isChecked() and self.ekf_enabled_cb.isChecked()
-        )
-        need_denoised = (
-            view_mode == "denoised" and self.ekf_enabled_cb.isChecked()
-        ) or use_denoised_for_vo
-        denoised_buf = None
-        if need_denoised and not was_cached:
-            denoised_buf = self._compute_denoised(depth, conf, conf_threshold)
-
-        depth_for_vo = (
-            denoised_buf.astype(depth.dtype)
-            if use_denoised_for_vo and denoised_buf is not None
-            else depth
-        )
-
-        if self.vo_enabled_cb.isChecked() and not was_cached:
-            result = self.vo.process(depth_for_vo, conf, ts)
-            self.vo_results[self.current_frame] = result
-
-            for key in [
-                "tracked",
-                "rejected",
-                "ratio",
-                "pos_x",
-                "pos_y",
-                "pos_z",
-                "mean_depth",
-                "mean_conf",
-                "fps",
-                "vo_score",
-            ]:
-                self.graph_data[key][self.current_frame] = result.get(key, 0)
-        else:
-            result = self.vo_results[self.current_frame]
+        # Prepare IMU data for engine
+        gyro = np.array([
+            self.imu_interpolated["gyro_x"][self.current_frame],
+            self.imu_interpolated["gyro_y"][self.current_frame],
+            self.imu_interpolated["gyro_z"][self.current_frame]
+        ])
+        accel = np.array([
+            self.imu_interpolated["acc_x"][self.current_frame],
+            self.imu_interpolated["acc_y"][self.current_frame],
+            self.imu_interpolated["acc_z"][self.current_frame]
+        ])
+        if self.imu_filter_enabled:
+            gyro = np.array([self.imu_filtered[k][self.current_frame] for k in ["gyro_x", "gyro_y", "gyro_z"]])
+            accel = np.array([self.imu_filtered[k][self.current_frame] for k in ["acc_x", "acc_y", "acc_z"]])
 
         prev_ts = None
         if self.current_frame > 0:
-            prev_frame = self.frames[self.current_frame - 1]
-            prev_ts = prev_frame["timestamp_ns"]
-
+            prev_frame = self.frame_loader.get_frame(self.current_frame - 1)
+            if prev_frame is not None:
+                prev_ts = prev_frame["timestamp_ns"]
         dt = (ts - prev_ts) / 1e9 if prev_ts else 0.033
 
-        gyro = np.array(
-            [
-                self.imu_interpolated["gyro_x"][self.current_frame],
-                self.imu_interpolated["gyro_y"][self.current_frame],
-                self.imu_interpolated["gyro_z"][self.current_frame],
-            ]
-        )
-
-        accel = np.array(
-            [
-                self.imu_interpolated["acc_x"][self.current_frame],
-                self.imu_interpolated["acc_y"][self.current_frame],
-                self.imu_interpolated["acc_z"][self.current_frame],
-            ]
-        )
-
-        if self.imu_filter_enabled:
-            accel = np.array(
-                [
-                    self.imu_filtered["acc_x"][self.current_frame],
-                    self.imu_filtered["acc_y"][self.current_frame],
-                    self.imu_filtered["acc_z"][self.current_frame],
-                ]
+        if self.vo_enabled_cb.isChecked() and not was_cached:
+            vo_res, fused_pos, denoised = self.engine.process_frame(
+                depth, conf, ts, gyro, accel, dt,
+                use_denoised=self.vo_use_denoised_cb.isChecked(),
+                denoise_alpha=self.denoise_alpha
             )
-            gyro = np.array(
-                [
-                    self.imu_filtered["gyro_x"][self.current_frame],
-                    self.imu_filtered["gyro_y"][self.current_frame],
-                    self.imu_filtered["gyro_z"][self.current_frame],
-                ]
-            )
+            self.vo_results[self.current_frame] = vo_res
+            self.current_depth = denoised if view_mode == "denoised" else depth
+            self.current_conf = conf
 
-        # Determine VO confidence and low-conf mode before EKF
+            for key in ["tracked", "rejected", "ratio", "pos_x", "pos_y", "pos_z", "mean_depth", "mean_conf", "fps", "vo_score"]:
+                self.graph_data[key][self.current_frame] = vo_res.get(key, 0)
+            
+            self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
+            self.graph_data["pos_fused_y"][self.current_frame] = fused_pos[1]
+            self.graph_data["pos_fused_z"][self.current_frame] = fused_pos[2]
+            
+            result = vo_res 
+            display_depth = self.current_depth
+        else:
+            result = self.vo_results[self.current_frame]
+            self.current_conf = conf
+            if result and self.ekf_enabled_cb.isChecked():
+                vo_pos = [result["pos_x"], result["pos_y"], result["pos_z"]]
+                fused_pos = self.engine.update_ekf(gyro, accel, dt, vo_pos, result.get("vo_score", 0.0))
+                self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
+                self.graph_data["pos_fused_y"][self.current_frame] = fused_pos[1]
+                self.graph_data["pos_fused_z"][self.current_frame] = fused_pos[2]
+            
+            # If we are in denoised mode but result was cached, we ideally want to show denoised depth.
+            # However, denoising is temporal and stateful. Since we are in 'else', we are either:
+            # 1. Sequential playback but VO was cached (this happens if user processed range before).
+            # 2. Scrubbing (was_cached will be False because we reset vo_results? No, vo_results persists).
+            # If it's sequential, we can still compute denoised depth.
+            if view_mode == "denoised" and self.ekf_enabled_cb.isChecked():
+                # Re-run denoising only to keep state consistent for display
+                denoised = self.engine.compute_denoised(depth, conf, conf_threshold, self.denoise_alpha)
+                self.current_depth = denoised
+                display_depth = denoised
+            else:
+                self.current_depth = depth
+                display_depth = depth
+
+        masked_depth = np.where(conf >= conf_threshold, depth, 0)
+        invalid_mask = conf < conf_threshold
+
+        # Update top-down map with latest VO result
         vo_score = result.get("vo_score", 0.0) if result else 0.0
         min_vo_conf = self.min_vo_conf_spin.value()
         conf_ok = (min_vo_conf == 0.0) or (vo_score >= min_vo_conf)
         low_conf_mode = self.config.get("low_conf_mode", "both")
         freeze_vo_path = not conf_ok and low_conf_mode in ("freeze_vo", "both")
 
-        if self.ekf_enabled_cb.isChecked():
-            # Convert units: gyro deg/s → rad/s, accel g → m/s²
-            gyro_rads = np.deg2rad(gyro)
-            accel_ms2 = accel * 9.81
-            # Apply gyro axis remapping (gyro and accel may use different physical axes)
-            gyro_rads = self._apply_gyro_remap(gyro_rads)
-            self.ekf.predict(gyro_rads, accel_ms2, dt)
-
-            if result and conf_ok:
-                # VO confidence sufficient — use measurement update
-                vo_pos = np.array(
-                    [
-                        result.get("pos_x", 0),
-                        result.get("pos_y", 0),
-                        result.get("pos_z", 0),
-                    ]
-                )
-                vo_confidence = result.get("mean_conf", 1.0)
-                self.ekf.update(vo_pos, vo_confidence)
-            # else: predict-only (IMU integration) when conf is low or no result
-
-            fused_pos = self.ekf.get_position()
-            self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
-            self.graph_data["pos_fused_y"][self.current_frame] = fused_pos[1]
-            self.graph_data["pos_fused_z"][self.current_frame] = fused_pos[2]
-
-        self.current_depth = depth
-        self.current_conf = conf
-
-        masked_depth = np.where(conf >= conf_threshold, depth, 0)
-        invalid_mask = conf < conf_threshold
-
-        # Update top-down map with latest VO result
-        # Only add depth cloud points for freshly computed results to avoid duplicates
         self._update_map(
             result,
             depth,
@@ -1926,15 +1789,6 @@ class DataViewer(QMainWindow):
             is_fresh=not was_cached,
             freeze_vo=freeze_vo_path,
         )
-
-        # --- Denoised depth for display (reuse buffer if already computed above) ---
-        if view_mode == "denoised" and self.ekf_enabled_cb.isChecked():
-            if denoised_buf is not None:
-                display_depth = denoised_buf
-            else:
-                display_depth = self._compute_denoised(depth, conf, conf_threshold)
-        else:
-            display_depth = masked_depth
 
         # --- Visualization ---
         def _depth_to_rgb(d_arr):
@@ -2021,6 +1875,61 @@ class DataViewer(QMainWindow):
                 label.setText("0.0")
 
         self._update_graph()
+
+
+    def _on_process_range_clicked(self):
+        if not self.session_dir:
+            return
+
+        min_idx, max_idx = self.range_slider.value()
+        self.process_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(min_idx, max_idx)
+        self.progress_bar.setValue(min_idx)
+
+        # Use a fresh engine instance for the worker to avoid thread safety issues
+        worker_engine = ProcessingEngine(self.config)
+        worker_engine.reset(self.imu_data)
+
+        self.process_thread = QThread()
+        self.process_worker = ProcessingWorker(
+            worker_engine,
+            self.frame_loader,
+            self.imu_interpolated,
+            min_idx,
+            max_idx
+        )
+        self.process_worker.moveToThread(self.process_thread)
+        
+        self.process_thread.started.connect(self.process_worker.run)
+        self.process_worker.progress.connect(self.progress_bar.setValue)
+        self.process_worker.finished.connect(self._on_processing_finished)
+        self.process_worker.finished.connect(self.process_thread.quit)
+        self.process_worker.finished.connect(self.process_worker.deleteLater)
+        self.process_thread.finished.connect(self.process_thread.deleteLater)
+        
+        self.process_thread.start()
+
+    def _on_processing_finished(self, results):
+        self.process_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        min_idx, _ = self.range_slider.value()
+        for i, res in enumerate(results):
+            frame_idx = min_idx + i
+            if res is not None:
+                vo_res, fused_pos = res
+                self.vo_results[frame_idx] = vo_res
+                if vo_res:
+                    for key in ["tracked", "rejected", "ratio", "pos_x", "pos_y", "pos_z", "mean_depth", "mean_conf", "fps", "vo_score"]:
+                        self.graph_data[key][frame_idx] = vo_res.get(key, 0)
+                
+                self.graph_data["pos_fused_x"][frame_idx] = fused_pos[0]
+                self.graph_data["pos_fused_y"][frame_idx] = fused_pos[1]
+                self.graph_data["pos_fused_z"][frame_idx] = fused_pos[2]
+
+        self._update_graph()
+        self.update_display()
 
 
 def main():
