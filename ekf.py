@@ -25,7 +25,12 @@ class ExtendedKalmanFilter:
         self.process_noise = 0.1
         self.measurement_noise = 1.0
 
+        # Wheelchair motion model constraints
+        self.max_speed = 2.0  # m/s — 0 = disabled
+        self.lateral_damping = 0.1  # 0 = no lateral motion, 1 = unconstrained
+
         self.prev_timestamp = None
+        self.last_dt = 0.033
 
         self.last_gyro = np.zeros(3)
         self.last_accel = np.zeros(3)
@@ -35,6 +40,7 @@ class ExtendedKalmanFilter:
         self.P = np.eye(6) * 0.1
         self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self.prev_timestamp = None
+        self.last_dt = 0.033
         self.last_gyro = np.zeros(3)
         self.last_accel = np.zeros(3)
 
@@ -83,6 +89,34 @@ class ExtendedKalmanFilter:
         norm = np.linalg.norm(self.q)
         if norm > 0:
             self.q = self.q / norm
+
+    def _apply_motion_constraints(self):
+        """Enforce wheelchair kinematic constraints on the velocity state.
+
+        1. Max speed clamp: limits ||velocity|| to max_speed.
+        2. Lateral damping: suppresses sideways velocity relative to the camera's
+           forward direction (non-holonomic constraint for a wheeled vehicle).
+           Camera +Z is forward in the camera frame (pinhole convention).
+           With Z=up in world frame, the floor plane is XY.
+        """
+        if self.max_speed > 0:
+            vel = self.state[3:6]
+            speed = np.linalg.norm(vel)
+            if speed > self.max_speed:
+                self.state[3:6] = vel * (self.max_speed / speed)
+
+        if self.lateral_damping < 1.0:
+            # Camera forward = [0, 0, 1] in camera frame, rotated to world frame
+            forward_world = self._quaternion_rotate(self.q, np.array([0.0, 0.0, 1.0]))
+            # Project onto the floor plane (Z=up → XY is floor)
+            forward_floor = np.array([forward_world[0], forward_world[1]])
+            fn = np.linalg.norm(forward_floor)
+            if fn > 1e-6:
+                forward_floor /= fn
+                vel_floor = self.state[3:5]
+                v_fwd = np.dot(vel_floor, forward_floor) * forward_floor
+                v_lat = vel_floor - v_fwd
+                self.state[3:5] = v_fwd + v_lat * self.lateral_damping
 
     def predict(self, gyro, accel, dt):
         if dt <= 0 or dt > 0.5:
@@ -136,6 +170,9 @@ class ExtendedKalmanFilter:
 
         self.last_gyro = gyro
         self.last_accel = accel
+        self.last_dt = dt
+
+        self._apply_motion_constraints()
 
     def update(self, vo_position, vo_confidence=1.0):
         if vo_position is None:
@@ -157,6 +194,13 @@ class ExtendedKalmanFilter:
 
         y = z - z_pred
 
+        # Innovation gate: reject VO measurements that imply physically impossible motion.
+        # Maximum plausible position change = max_speed × dt × generous_margin (5×).
+        if self.max_speed > 0 and self.last_dt > 0:
+            max_plausible = self.max_speed * self.last_dt * 5.0
+            if np.linalg.norm(y) > max_plausible:
+                return  # discard this measurement — too large to be real
+
         S = H @ self.P @ H.T + R_matrix
         K = self.P @ H.T @ np.linalg.inv(S)
 
@@ -173,8 +217,21 @@ class ExtendedKalmanFilter:
                 + self.fixed_height * self.height_strength
             )
 
+        self._apply_motion_constraints()
+
     def get_position(self):
         return self.state[0], self.state[1], self.state[2]
 
     def get_velocity(self):
         return self.state[3], self.state[4], self.state[5]
+
+    def get_rotation_matrix(self):
+        """Convert the internal quaternion [w, x, y, z] to a 3x3 rotation matrix."""
+        w, x, y, z = self.q
+        return np.array(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+            ]
+        )

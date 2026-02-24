@@ -31,6 +31,7 @@ class VisualOdometry:
         self.mean_depth = 0.0
         self.mean_conf = 0.0
         self.fps = 0.0
+        self._last_inlier_ratio = 0.0
 
         self._frame_times = []
 
@@ -100,10 +101,22 @@ class VisualOdometry:
         # 1. Prepare Masks
         if conf is not None:
             mask_conf = (conf >= conf_threshold).astype(np.uint8) * 255
-            masked_depth = np.where(conf >= conf_threshold, depth, 0)
+            masked_depth = np.where(conf >= conf_threshold, depth, 0).astype(np.float32)
         else:
             mask_conf = np.ones_like(depth, dtype=np.uint8) * 255
-            masked_depth = depth
+            masked_depth = depth.astype(np.float32)
+
+        # 1b. Apply spatial filters to masked depth before VO processing.
+        # These run on the same data the VO uses (not just visualization), so
+        # feature detection and scale recovery both benefit from the denoised depth.
+        if self.config.get("median_enabled", False):
+            k = int(self.config.get("median_k", 5))
+            masked_depth = cv2.medianBlur(masked_depth, k)
+        if self.config.get("bilateral_enabled", False):
+            d = int(self.config.get("bilateral_d", 9))
+            sc = float(self.config.get("bilateral_sigma_color", 200))
+            ss = float(self.config.get("bilateral_sigma_space", 20))
+            masked_depth = cv2.bilateralFilter(masked_depth, d, sc, ss)
 
         # 2. Preprocess Image (Depth -> Grayscale uint8)
         gray = self._preprocess(masked_depth)
@@ -120,6 +133,9 @@ class VisualOdometry:
             "fps": 0.0,
             "tracked_pts": [],
             "rejected_pts": [],
+            "R_world": self.R_world.copy(),
+            "stationary": False,
+            "vo_score": 0.0,
         }
 
         # Stats
@@ -149,6 +165,9 @@ class VisualOdometry:
             )
         else:
             p1, st, err = None, None, None
+
+        valid_tracked = 0
+        is_stationary = False
 
         # 5. Filter Bad Points
         if p1 is not None:
@@ -181,8 +200,20 @@ class VisualOdometry:
             result["ratio"] = self.ratio
             result["tracked_pts"] = good_new.reshape(-1, 2).tolist()
 
-            # 6. Pose Estimation (Only if we have enough points)
-            if valid_tracked > 6:  # Need min 5 for finding Essential Matrix
+            # Stationary detection: if mean flow is below threshold, skip pose update
+            if valid_tracked > 0:
+                displacements = np.linalg.norm(
+                    good_new.reshape(-1, 2) - good_old.reshape(-1, 2), axis=1
+                )
+                mean_disp = float(np.mean(displacements))
+            else:
+                mean_disp = 0.0
+
+            is_stationary = mean_disp < self.stationary_threshold
+            result["stationary"] = is_stationary
+
+            # 6. Pose Estimation (Only if we have enough points and camera is moving)
+            if valid_tracked > 6 and not is_stationary:
                 try:
                     # Calculate Essential Matrix
                     E, mask_pose = cv2.findEssentialMat(
@@ -196,6 +227,12 @@ class VisualOdometry:
                     )
 
                     if E is not None and E.shape == (3, 3):
+                        # Capture RANSAC inlier ratio for confidence scoring
+                        if mask_pose is not None:
+                            self._last_inlier_ratio = float(mask_pose.sum()) / max(
+                                1, len(mask_pose.ravel())
+                            )
+
                         _, R, t, _ = cv2.recoverPose(
                             E,
                             good_old,
@@ -243,6 +280,15 @@ class VisualOdometry:
         result["pos_x"] = float(self.position[0])
         result["pos_y"] = float(self.position[1])
         result["pos_z"] = float(self.position[2])
+        result["R_world"] = self.R_world.copy()
+
+        # VO confidence score [0.0, 1.0]:
+        #   ratio_norm   – fraction of tracked points that survived optical flow
+        #   inlier_ratio – fraction of RANSAC inliers in Essential Matrix estimation
+        #   count_factor – saturates at 50 tracked points (diminishing returns above that)
+        ratio_norm = (result["ratio"] / 100.0) if not is_stationary else 1.0
+        count_factor = min(1.0, valid_tracked / 50.0) if valid_tracked > 0 else 0.0
+        result["vo_score"] = ratio_norm * self._last_inlier_ratio * count_factor
 
         # 7. Replenishment (Crucial Fix)
         # Instead of resetting when < 10, we add points if < target
@@ -318,4 +364,5 @@ class VisualOdometry:
         self.mean_depth = 0.0
         self.mean_conf = 0.0
         self.fps = 0.0
+        self._last_inlier_ratio = 0.0
         self._frame_times = []
