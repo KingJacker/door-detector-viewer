@@ -2,15 +2,21 @@ import numpy as np
 
 
 class ExtendedKalmanFilter:
+    """6-state EKF: position (x, y, z) + velocity (vx, vy, vz).
+
+    Orientation is tracked separately via quaternion integration and used only
+    to rotate IMU accelerations into the world frame before feeding the EKF.
+    """
+
     def __init__(self):
-        self.state = np.zeros(10)
-        self.state[9] = 1.0
+        # State: [px, py, pz, vx, vy, vz]
+        self.state = np.zeros(6)
+        self.P = np.eye(6) * 0.1
 
-        self.P = np.eye(10) * 0.1
+        # Orientation quaternion [w, x, y, z] (not part of state vector)
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
 
-        self.q = np.array([0, 0, 0, 1.0])
-
-        self.up_direction = np.array([0, 0, 1.0])
+        self.up_direction = np.array([0.0, 0.0, 1.0])
 
         self.fixed_height_enabled = False
         self.fixed_height = 1.2
@@ -25,17 +31,16 @@ class ExtendedKalmanFilter:
         self.last_accel = np.zeros(3)
 
     def reset(self):
-        self.state = np.zeros(10)
-        self.state[9] = 1.0
-        self.P = np.eye(10) * 0.1
-        self.q = np.array([0, 0, 0, 1.0])
+        self.state = np.zeros(6)
+        self.P = np.eye(6) * 0.1
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
         self.prev_timestamp = None
         self.last_gyro = np.zeros(3)
         self.last_accel = np.zeros(3)
 
     def detect_up_direction(self, imu_data, samples=100):
         if imu_data is None or len(imu_data) < 10:
-            self.up_direction = np.array([0, 0, 1.0])
+            self.up_direction = np.array([0.0, 0.0, 1.0])
             return
 
         accel_data = imu_data[:, 1:4]
@@ -43,9 +48,9 @@ class ExtendedKalmanFilter:
         mean_accel = np.mean(accel_data[:n], axis=0)
         norm = np.linalg.norm(mean_accel)
         if norm > 0:
-            self.up_direction = -mean_accel / norm
+            self.up_direction = mean_accel / norm
         else:
-            self.up_direction = np.array([0, 0, 1.0])
+            self.up_direction = np.array([0.0, 0.0, 1.0])
 
     def set_fixed_height(self, enabled, height_meters=1.2, strength=0.5):
         self.fixed_height_enabled = enabled
@@ -70,7 +75,7 @@ class ExtendedKalmanFilter:
 
     def _quaternion_rotate(self, q, v):
         q_conj = np.array([q[0], -q[1], -q[2], -q[3]])
-        v_quat = np.array([0, v[0], v[1], v[2]])
+        v_quat = np.array([0.0, v[0], v[1], v[2]])
         result = self._quaternion_multiply(self._quaternion_multiply(q, v_quat), q_conj)
         return result[1:4]
 
@@ -83,39 +88,51 @@ class ExtendedKalmanFilter:
         if dt <= 0 or dt > 0.5:
             return
 
+        # --- Quaternion integration (q = [w, x, y, z]) ---
         q = self.q
-
         omega = gyro
+        # Correct quaternion kinematics: q_dot = 0.5 * Omega(omega) * q
         q_dot = 0.5 * np.array(
             [
                 -omega[0] * q[1] - omega[1] * q[2] - omega[2] * q[3],
-                omega[0] * q[0] + omega[2] * q[2] - omega[1] * q[3],
-                -omega[0] * q[2] + omega[1] * q[0] + omega[2] * q[1],
-                omega[0] * q[3] + omega[1] * q[2] - omega[2] * q[1],
+                omega[0] * q[0] - omega[1] * q[3] + omega[2] * q[2],
+                omega[0] * q[3] + omega[1] * q[0] - omega[2] * q[1],
+                -omega[0] * q[2] + omega[1] * q[1] + omega[2] * q[0],
             ]
         )
-
         self.q = self.q + q_dot * dt
         self._normalize_quaternion()
 
+        # --- Rotate accel into world frame and remove gravity ---
         accel_world = self._quaternion_rotate(self.q, accel)
-
         gravity = 9.81 * self.up_direction
         accel_corrected = accel_world - gravity
 
-        self.state[0] += self.state[3] * dt + 0.5 * accel_corrected[0] * dt * dt
-        self.state[1] += self.state[4] * dt + 0.5 * accel_corrected[1] * dt * dt
-        self.state[2] += self.state[5] * dt + 0.5 * accel_corrected[2] * dt * dt
+        # --- State transition: constant-acceleration kinematics ---
+        ax, ay, az = accel_corrected
+        # pos += vel*dt + 0.5*acc*dt²
+        self.state[0] += self.state[3] * dt + 0.5 * ax * dt * dt
+        self.state[1] += self.state[4] * dt + 0.5 * ay * dt * dt
+        self.state[2] += self.state[5] * dt + 0.5 * az * dt * dt
+        # vel += acc*dt
+        self.state[3] += ax * dt
+        self.state[4] += ay * dt
+        self.state[5] += az * dt
 
-        self.state[3] += accel_corrected[0] * dt
-        self.state[4] += accel_corrected[1] * dt
-        self.state[5] += accel_corrected[2] * dt
+        # --- Covariance propagation with Jacobian F ---
+        # F = d(f)/d(state) for [p, v]:
+        #   p_new = p + v*dt  =>  dp_new/dp=I, dp_new/dv=I*dt
+        #   v_new = v + a*dt  =>  dv_new/dp=0, dv_new/dv=I
+        F = np.eye(6)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
 
-        Q = np.eye(10) * self.process_noise
+        Q = np.eye(6) * self.process_noise
         Q[0:3, 0:3] *= dt * dt
         Q[3:6, 3:6] *= dt * dt
 
-        self.P = self.P + Q
+        self.P = F @ self.P @ F.T + Q
 
         self.last_gyro = gyro
         self.last_accel = accel
@@ -126,9 +143,11 @@ class ExtendedKalmanFilter:
 
         measured = np.array(vo_position)
 
-        R = self.measurement_noise / (vo_confidence + 0.01)
+        r_scalar = self.measurement_noise / (vo_confidence + 0.01)
+        R_matrix = np.eye(3) * r_scalar
 
-        H = np.zeros((3, 10))
+        # Observation matrix: we observe position directly
+        H = np.zeros((3, 6))
         H[0, 0] = 1.0
         H[1, 1] = 1.0
         H[2, 2] = 1.0
@@ -138,23 +157,21 @@ class ExtendedKalmanFilter:
 
         y = z - z_pred
 
-        S = H @ self.P @ H.T + np.eye(3) * R
-
+        S = H @ self.P @ H.T + R_matrix
         K = self.P @ H.T @ np.linalg.inv(S)
 
         self.state = self.state + K @ y
 
-        I_KH = np.eye(10) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+        # Joseph form for numerical stability
+        I_KH = np.eye(6) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R_matrix @ K.T
 
         if self.fixed_height_enabled:
-            z_idx = 2
-            current_z = self.state[z_idx]
-            constrained_z = (
+            current_z = self.state[2]
+            self.state[2] = (
                 current_z * (1 - self.height_strength)
                 + self.fixed_height * self.height_strength
             )
-            self.state[z_idx] = constrained_z
 
     def get_position(self):
         return self.state[0], self.state[1], self.state[2]

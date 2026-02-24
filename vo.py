@@ -2,13 +2,14 @@ import cv2
 import numpy as np
 import time
 
+
 class VisualOdometry:
     def __init__(self, config):
         self.config = config
 
         # Increase this if you want more robust tracking
-        self.target_features = 200 
-        self.min_features = 50     
+        self.target_features = 200
+        self.min_features = 50
 
         self.width = 240
         self.height = 180
@@ -19,6 +20,7 @@ class VisualOdometry:
 
         self.prev_gray = None
         self.prev_pts = None
+        self.prev_depth = None
 
         self.position = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         self.R_world = np.eye(3)
@@ -43,8 +45,13 @@ class VisualOdometry:
 
     def _sensor_diagonal_mm(self, sensor_size):
         sizes = {
-            "1/6": 3.0, "1/4": 4.0, "1/3": 6.0,
-            "1/2.7": 7.0, "1/2": 8.0, "2/3": 11.0, "1": 16.0,
+            "1/6": 3.0,
+            "1/4": 4.0,
+            "1/3": 6.0,
+            "1/2.7": 7.0,
+            "1/2": 8.0,
+            "2/3": 11.0,
+            "1": 16.0,
         }
         return sizes.get(sensor_size, 3.0)
 
@@ -89,7 +96,7 @@ class VisualOdometry:
         start_time = time.time()
 
         conf_threshold = self.config.get("conf_threshold", 100)
-        
+
         # 1. Prepare Masks
         if conf is not None:
             mask_conf = (conf >= conf_threshold).astype(np.uint8) * 255
@@ -102,12 +109,17 @@ class VisualOdometry:
         gray = self._preprocess(masked_depth)
 
         result = {
-            "tracked": 0, "rejected": 0, "ratio": 0.0,
-            "pos_x": float(self.position[0]), 
-            "pos_y": float(self.position[1]), 
+            "tracked": 0,
+            "rejected": 0,
+            "ratio": 0.0,
+            "pos_x": float(self.position[0]),
+            "pos_y": float(self.position[1]),
             "pos_z": float(self.position[2]),
-            "mean_depth": 0.0, "mean_conf": 0.0, "fps": 0.0,
-            "tracked_pts": [], "rejected_pts": []
+            "mean_depth": 0.0,
+            "mean_conf": 0.0,
+            "fps": 0.0,
+            "tracked_pts": [],
+            "rejected_pts": [],
         }
 
         # Stats
@@ -124,8 +136,9 @@ class VisualOdometry:
                 self.prev_pts = cv2.KeyPoint_convert(kp).reshape(-1, 1, 2)
             else:
                 self.prev_pts = np.empty((0, 1, 2), dtype=np.float32)
-            
+
             self.prev_gray = gray
+            self.prev_depth = masked_depth
             result["tracked"] = len(self.prev_pts)
             return result
 
@@ -143,7 +156,7 @@ class VisualOdometry:
             if err is not None:
                 # Filter by tracking error (optical flow consistency)
                 good_indices = good_indices & (err.flatten() <= self.quality_threshold)
-            
+
             # Ensure points stay within image bounds
             h, w = gray.shape
             for i, pt in enumerate(p1):
@@ -154,60 +167,74 @@ class VisualOdometry:
 
             good_new = p1[good_indices]
             good_old = self.prev_pts[good_indices]
-            
+
             # Update stats
             total_tracked = len(self.prev_pts)
             valid_tracked = len(good_new)
             self.rejected_count = total_tracked - valid_tracked
-            self.ratio = (valid_tracked / total_tracked * 100) if total_tracked > 0 else 0.0
+            self.ratio = (
+                (valid_tracked / total_tracked * 100) if total_tracked > 0 else 0.0
+            )
 
             result["tracked"] = valid_tracked
             result["rejected"] = self.rejected_count
             result["ratio"] = self.ratio
             result["tracked_pts"] = good_new.reshape(-1, 2).tolist()
-            
+
             # 6. Pose Estimation (Only if we have enough points)
-            if valid_tracked > 6: # Need min 5 for finding Essential Matrix
+            if valid_tracked > 6:  # Need min 5 for finding Essential Matrix
                 try:
                     # Calculate Essential Matrix
                     E, mask_pose = cv2.findEssentialMat(
-                        good_old, good_new, 
-                        focal=self.focal_length, pp=self.center,
-                        method=cv2.RANSAC, prob=0.999, threshold=1.0
+                        good_old,
+                        good_new,
+                        focal=self.focal_length,
+                        pp=self.center,
+                        method=cv2.RANSAC,
+                        prob=0.999,
+                        threshold=1.0,
                     )
 
                     if E is not None and E.shape == (3, 3):
                         _, R, t, _ = cv2.recoverPose(
-                            E, good_old, good_new, 
-                            focal=self.focal_length, pp=self.center
+                            E,
+                            good_old,
+                            good_new,
+                            focal=self.focal_length,
+                            pp=self.center,
                         )
 
                         # Scale Recovery using Depth
                         # We look up the depth of the tracked points to scale the unit vector 't'
                         depths = []
-                        for pt in good_old: # Use old points for depth lookup (matches prev frame)
+                        prev_depth_map = (
+                            self.prev_depth
+                            if self.prev_depth is not None
+                            else masked_depth
+                        )
+                        for (
+                            pt
+                        ) in good_old:  # Use old points in previous frame's depth map
                             x, y = int(pt[0][0]), int(pt[0][1])
-                            # Check bounds again just to be safe
                             if 0 <= x < self.width and 0 <= y < self.height:
-                                # We need depth from the PREVIOUS frame for strictly correct math,
-                                # but using current masked_depth is a common approximation.
-                                # Ideally, cache prev_depth. For now, use current.
-                                d = masked_depth[y, x] 
-                                if d > 100: # Ignore noise/0 depth
+                                d = prev_depth_map[y, x]
+                                if d > 100:  # Ignore noise/0 depth
                                     depths.append(d)
 
                         if depths:
                             median_depth = np.median(depths)
-                            # Simple scale estimation
-                            t_scaled = t * median_depth
-                            
+                            # Scale t (unit vector) by depth; depth is in mm, convert to meters
+                            t_scaled = t * (median_depth / 1000.0)
+
                             # Update Global Position
-                            # pos = pos + R_current * t_scaled
-                            self.position += (self.R_world @ t_scaled).flatten()
-                            self.R_world = self.R_world @ R
+                            # recoverPose gives R, t such that p2 = R @ p1 + t
+                            # In world frame: new_pos = old_pos + R_world @ R.T @ t_scaled
+                            # R_world tracks the cumulative rotation (world <- camera)
+                            self.position += (self.R_world @ R.T @ t_scaled).flatten()
+                            self.R_world = self.R_world @ R.T
 
                 except Exception as e:
-                    # print(f"VO Error: {e}") 
+                    # print(f"VO Error: {e}")
                     pass
 
         else:
@@ -224,10 +251,10 @@ class VisualOdometry:
             mask_replenish = mask_conf.copy()
             for pt in good_new:
                 cv2.circle(mask_replenish, (int(pt[0][0]), int(pt[0][1])), 8, 0, -1)
-            
+
             # Detect new features in empty areas
             kp_new = self.detector.detect(gray, mask_replenish)
-            
+
             if kp_new:
                 pts_new = cv2.KeyPoint_convert(kp_new).reshape(-1, 1, 2)
                 # Stack existing tracked points with new points
@@ -239,6 +266,7 @@ class VisualOdometry:
         # 8. Update State for Next Frame
         self.prev_gray = gray
         self.prev_pts = good_new
+        self.prev_depth = masked_depth
 
         # FPS Calculation
         if timestamp_ns:
@@ -247,7 +275,7 @@ class VisualOdometry:
                 if dt > 0:
                     current_fps = 1.0 / dt
                     self.fps = 0.9 * self.fps + 0.1 * current_fps
-            
+
             self._frame_times.append(timestamp_ns)
             if len(self._frame_times) > 30:
                 self._frame_times.pop(0)
@@ -263,15 +291,17 @@ class VisualOdometry:
         # Avoid cv2.NORM_MINMAX on every frame because it causes flickering
         # if the min/max depth in the scene changes.
         # Fixed scaling is better. Assuming max range ~4000mm.
-        
+
         # Apply CLAHE if enabled
         if self.clahe is not None:
             # Normalize reasonably to 0-255 for CLAHE
             # detailed structure is more important than absolute value here
-            gray = cv2.normalize(depth_f, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            gray = cv2.normalize(depth_f, None, 0, 255, cv2.NORM_MINMAX).astype(
+                np.uint8
+            )
             gray = self.clahe.apply(gray)
             return gray
-        
+
         # Fallback if CLAHE is off
         normalized = cv2.normalize(depth_f, None, 0, 255, cv2.NORM_MINMAX)
         return normalized.astype(np.uint8)
@@ -279,6 +309,7 @@ class VisualOdometry:
     def reset(self):
         self.prev_gray = None
         self.prev_pts = None
+        self.prev_depth = None
         self.position = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         self.R_world = np.eye(3)
         self.tracked_count = 0

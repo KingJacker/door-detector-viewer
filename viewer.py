@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import cv2
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtWidgets
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -57,6 +56,7 @@ class DataViewer(QMainWindow):
         self.vo_results = []
 
         self.ekf = ExtendedKalmanFilter()
+        self.last_displayed_frame = -1
 
         self.imu_filtered = {
             key: [] for key in ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
@@ -412,7 +412,6 @@ class DataViewer(QMainWindow):
         self._update_clahe_params()
         layout.addWidget(clahe_group)
 
-
         bilateral_group = QGroupBox()
         self.bilateral_layout = QFormLayout(bilateral_group)
         self.bilateral_cb = QCheckBox("Bilateral Filter")
@@ -522,14 +521,15 @@ class DataViewer(QMainWindow):
         self.fixed_height_slider = QSlider(Qt.Orientation.Horizontal)
         self.fixed_height_slider.setRange(50, 250)
         self.fixed_height_slider.setValue(120)
-        self.fixed_height_slider.setToolTip("Fixed height in cm")
+        self.fixed_height_slider.setToolTip("Fixed height in meters (slider ÷ 100)")
         self.fixed_height_slider.valueChanged.connect(
             lambda v: self._on_height_param_changed(v / 100)
         )
         self.fixed_height_spin = QDoubleSpinBox()
-        self.fixed_height_spin.setRange(0, 200)
-        self.fixed_height_spin.setValue(120)
-        self.fixed_height_spin.setSingleStep(1)
+        self.fixed_height_spin.setRange(0.5, 2.5)
+        self.fixed_height_spin.setValue(1.2)
+        self.fixed_height_spin.setSingleStep(0.05)
+        self.fixed_height_spin.setSuffix(" m")
         self.fixed_height_spin.valueChanged.connect(
             lambda v: self._on_height_param_changed(v)
         )
@@ -573,6 +573,9 @@ class DataViewer(QMainWindow):
         self.imu_alpha_slider = QSlider(Qt.Orientation.Horizontal)
         self.imu_alpha_slider.setRange(0, 100)
         self.imu_alpha_slider.setValue(80)
+        self.imu_alpha_slider.setToolTip(
+            "Low-pass alpha: 1.0 = no filtering (raw), 0.0 = maximum smoothing"
+        )
         self.imu_alpha_slider.valueChanged.connect(
             lambda v: self._on_imu_alpha_changed(v / 100)
         )
@@ -580,13 +583,16 @@ class DataViewer(QMainWindow):
         self.imu_alpha_spin.setRange(0.0, 1.0)
         self.imu_alpha_spin.setValue(0.8)
         self.imu_alpha_spin.setSingleStep(0.05)
+        self.imu_alpha_spin.setToolTip(
+            "Low-pass alpha: 1.0 = no filtering (raw), 0.0 = maximum smoothing"
+        )
         self.imu_alpha_spin.valueChanged.connect(
             lambda v: self._on_imu_alpha_changed(v)
         )
         h = QHBoxLayout()
         h.addWidget(self.imu_alpha_slider)
         h.addWidget(self.imu_alpha_spin)
-        imu_layout.addRow("Alpha:", h)
+        imu_layout.addRow("Alpha (1=raw):", h)
 
         self.imu_layout = imu_layout
         self.imu_rows = list(range(1, imu_layout.rowCount()))
@@ -660,13 +666,13 @@ class DataViewer(QMainWindow):
         for row in self.fixed_height_rows:
             self.ekf_layout.setRowVisible(row, enabled)
 
-    def _on_height_param_changed(self, height):
-        self.ekf.fixed_height = height
+    def _on_height_param_changed(self, height_meters):
+        self.ekf.fixed_height = height_meters
         self.fixed_height_slider.blockSignals(True)
-        self.fixed_height_slider.setValue(int(height * 100))
+        self.fixed_height_slider.setValue(int(height_meters * 100))
         self.fixed_height_slider.blockSignals(False)
         self.fixed_height_spin.blockSignals(True)
-        self.fixed_height_spin.setValue(height)
+        self.fixed_height_spin.setValue(height_meters)
         self.fixed_height_spin.blockSignals(False)
 
     def _on_height_strength_changed(self, strength):
@@ -691,31 +697,26 @@ class DataViewer(QMainWindow):
         self.imu_alpha_spin.blockSignals(True)
         self.imu_alpha_spin.setValue(alpha)
         self.imu_alpha_spin.blockSignals(False)
+        if self.frames:
+            self._recompute_imu_filter()
 
     def _init_ekf_from_imu(self):
         if self.imu_data is not None and len(self.imu_data) > 10:
             self.ekf.detect_up_direction(self.imu_data)
 
-    def _graph_mouse_move(self, ev):
-        pos = ev.pos()
-        vb = self.graph_widget.getViewBox()
-        mouse_point = vb.mapSceneToView(pos)
-        x = int(mouse_point.x())
-
-        min_idx, max_idx = self.range_slider.value()
-        if min_idx <= x <= max_idx and self.graph_data.get("tracked"):
-            tooltip_lines = [f"Frame: {x}"]
-            for key, curve in self.plot_curves.items():
-                if curve.isVisible() and 0 <= x - min_idx < len(
-                    self.graph_data.get(key, [])
-                ):
-                    value = self.graph_data[key][x - min_idx]
-                    tooltip_lines.append(f"{key}: {value:.2f}")
-            self.graph_widget.setToolTip("<br>".join(tooltip_lines))
-        else:
-            self.graph_widget.setToolTip("")
-
-        ev.accept()
+    def _recompute_imu_filter(self):
+        alpha = self.imu_filter_alpha
+        keys = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
+        n = len(self.frames)
+        for key in keys:
+            raw = self.imu_interpolated[key]
+            filtered = [0.0] * n
+            prev = raw[0] if n > 0 else 0.0
+            for i in range(n):
+                val = alpha * raw[i] + (1 - alpha) * prev
+                filtered[i] = val
+                prev = val
+            self.imu_filtered[key] = filtered
 
     def _on_range_changed(self):
         min_idx, max_idx = self.range_slider.value()
@@ -810,12 +811,19 @@ class DataViewer(QMainWindow):
     def session_selected(self, name):
         if not name:
             return
+        self.playback_timer.stop()
+        self.play_btn.setText("Play")
+        self.playing = False
         data_dir = Path(__file__).parent / "data"
         self.session_dir = data_dir / name
 
         frames_dir = self.session_dir / "frames"
+        if not frames_dir.exists():
+            return
         frame_files = sorted(frames_dir.glob("frame_*.npz"))
         self.frames = [np.load(f) for f in frame_files]
+        if not self.frames:
+            return
 
         imu_path = self.session_dir / "imu_data.csv"
         if imu_path.exists():
@@ -847,11 +855,10 @@ class DataViewer(QMainWindow):
         if self.imu_data is not None and len(self.imu_data) > 10:
             self.ekf.detect_up_direction(self.imu_data)
 
-        for key in ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]:
-            self.imu_filtered[key] = [0.0] * len(self.frames)
-            self.imu_prev[key] = 0.0
+        self._recompute_imu_filter()
 
         self.current_frame = 0
+        self.last_displayed_frame = -1
         self.slider.setMaximum(len(self.frames) - 1)
         self.slider.setValue(0)
         self.range_slider.setRange(0, len(self.frames) - 1)
@@ -875,6 +882,10 @@ class DataViewer(QMainWindow):
         if not self.frames:
             return
         self.vo.reset()
+        self.ekf.reset()
+        self._init_ekf_from_imu()
+        self._recompute_imu_filter()
+        self.last_displayed_frame = -1
         self.vo_results = [None] * len(self.frames)
         for key in [
             "tracked",
@@ -888,6 +899,8 @@ class DataViewer(QMainWindow):
             "fps",
         ]:
             self.graph_data[key] = [0] * len(self.frames)
+        for key in ["pos_fused_x", "pos_fused_y", "pos_fused_z"]:
+            self.graph_data[key] = [0.0] * len(self.frames)
         self.update_display()
 
     def slider_moved(self, value):
@@ -949,7 +962,7 @@ class DataViewer(QMainWindow):
 
         min_idx, max_idx = self.range_slider.value()
         data_len = len(self.graph_data.get("tracked", []))
-        if min_idx <= x < max_idx and x < data_len and self.graph_data.get("tracked"):
+        if min_idx <= x <= max_idx and x < data_len and self.graph_data.get("tracked"):
             lines = [f"<div style='text-align: center'><b>Frame {x}</b><br>"]
             for key, curve in self.plot_curves.items():
                 if curve.isVisible() and x < len(self.graph_data.get(key, [])):
@@ -992,6 +1005,20 @@ class DataViewer(QMainWindow):
     def update_display(self):
         if not self.frames:
             return
+
+        # Detect non-sequential frame access (scrubbing) and reset stateful algorithms
+        jumped = (
+            self.last_displayed_frame >= 0
+            and self.current_frame != self.last_displayed_frame + 1
+        )
+        if jumped:
+            self.vo.reset()
+            self.ekf.reset()
+            self._init_ekf_from_imu()
+            self.graph_data["pos_fused_x"][self.current_frame] = 0.0
+            self.graph_data["pos_fused_y"][self.current_frame] = 0.0
+            self.graph_data["pos_fused_z"][self.current_frame] = 0.0
+        self.last_displayed_frame = self.current_frame
 
         frame = self.frames[self.current_frame]
         view_mode = self.view_combo.currentText()
@@ -1047,22 +1074,6 @@ class DataViewer(QMainWindow):
         )
 
         if self.imu_filter_enabled:
-            alpha = self.imu_filter_alpha
-            for i, key in enumerate(
-                ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
-            ):
-                raw = [
-                    self.imu_interpolated["acc_x"][self.current_frame],
-                    self.imu_interpolated["acc_y"][self.current_frame],
-                    self.imu_interpolated["acc_z"][self.current_frame],
-                    self.imu_interpolated["gyro_x"][self.current_frame],
-                    self.imu_interpolated["gyro_y"][self.current_frame],
-                    self.imu_interpolated["gyro_z"][self.current_frame],
-                ][i]
-                filtered = alpha * raw + (1 - alpha) * self.imu_prev[key]
-                self.imu_filtered[key][self.current_frame] = filtered
-                self.imu_prev[key] = filtered
-
             accel = np.array(
                 [
                     self.imu_filtered["acc_x"][self.current_frame],
@@ -1082,15 +1093,16 @@ class DataViewer(QMainWindow):
             self.ekf.predict(gyro, accel, dt)
 
             if result:
-                vo_pos = np.array([
-                    result.get("pos_x", 0),
-                    result.get("pos_y", 0),
-                    result.get("pos_z", 0),
-                ])
+                vo_pos = np.array(
+                    [
+                        result.get("pos_x", 0),
+                        result.get("pos_y", 0),
+                        result.get("pos_z", 0),
+                    ]
+                )
 
-                R = np.eye(3) * self.ekf.measurement_noise
-                
-                self.ekf.update(vo_pos, R)
+                vo_confidence = result.get("mean_conf", 1.0)
+                self.ekf.update(vo_pos, vo_confidence)
 
             fused_pos = self.ekf.get_position()
             self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
@@ -1127,19 +1139,20 @@ class DataViewer(QMainWindow):
 
         if self.show_tracked_cb.isChecked() or self.show_rejected_cb.isChecked():
             if self.current_frame < len(self.vo_results):
-                result = self.vo_results[self.current_frame]
+                overlay_result = self.vo_results[self.current_frame]
 
-                if self.show_tracked_cb.isChecked():
-                    for pt in result.get("tracked_pts", []):
-                        x, y = int(pt[0]), int(pt[1])
-                        if 0 <= x < data.shape[1] and 0 <= y < data.shape[0]:
-                            cv2.circle(data, (x, y), 3, (0, 255, 0), -1)
+                if overlay_result is not None:
+                    if self.show_tracked_cb.isChecked():
+                        for pt in overlay_result.get("tracked_pts", []):
+                            x, y = int(pt[0]), int(pt[1])
+                            if 0 <= x < data.shape[1] and 0 <= y < data.shape[0]:
+                                cv2.circle(data, (x, y), 3, (0, 255, 0), -1)
 
-                if self.show_rejected_cb.isChecked():
-                    for pt in result.get("rejected_pts", []):
-                        x, y = int(pt[0]), int(pt[1])
-                        if 0 <= x < data.shape[1] and 0 <= y < data.shape[0]:
-                            cv2.circle(data, (x, y), 3, (255, 0, 0), -1)
+                    if self.show_rejected_cb.isChecked():
+                        for pt in overlay_result.get("rejected_pts", []):
+                            x, y = int(pt[0]), int(pt[1])
+                            if 0 <= x < data.shape[1] and 0 <= y < data.shape[0]:
+                                cv2.circle(data, (x, y), 3, (255, 0, 0), -1)
 
         h, w = data.shape[:2]
         bytes_per_line = data.strides[0]
@@ -1152,11 +1165,6 @@ class DataViewer(QMainWindow):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
-
-        ts = frame["timestamp_ns"]
-        info = f"Frame {self.current_frame + 1}/{len(self.frames)} | Timestamp: {ts}"
-        if self.imu_data is not None:
-            info += f" | IMU samples: {len(self.imu_data)}"
 
         for key, label in self.series_labels.items():
             if self.current_frame < len(self.graph_data.get(key, [])):
