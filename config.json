@@ -1,0 +1,19 @@
+{
+  "conf_threshold": 20,
+  "show_masked": false,
+  "view_mode": "depth",
+  "playback_speed": 30,
+  "bilateral_enabled": false,
+  "median_enabled": true,
+  "bilateral_d": 9,
+  "bilateral_sigma_color": 200,
+  "bilateral_sigma_space": 20,
+  "median_k": 5,
+  "detector_threshold": 25,
+  "rejection_threshold": 9.9,
+  "stationary_threshold": 0.02,
+  "vo_enabled": false,
+  "clahe_enabled": false,
+  "clahe_clip_limit": 1.0,
+  "clahe_grid_size": 8
+}
