@@ -1124,6 +1124,24 @@ class DataViewer(QMainWindow):
         )
         ekf_layout.addRow("Low Conf Mode:", self.low_conf_mode_combo)
 
+        self.ekf_anchor_cb = QCheckBox("Anchor velocity on stationary")
+        self.ekf_anchor_cb.setChecked(self.config.get("ekf_anchor_enabled", True))
+        self.ekf_anchor_cb.setToolTip(
+            "If enabled, snaps EKF velocity to 0 when VO detects stationary state.\n"
+            "Prevents point cloud drift during pauses."
+        )
+        self.ekf_anchor_cb.toggled.connect(self._on_ekf_params_changed)
+        ekf_layout.addRow(self.ekf_anchor_cb)
+
+        ac = self.config.get("anchor_confidence", 0.5)
+        self.anchor_conf_spin = QDoubleSpinBox()
+        self.anchor_conf_spin.setRange(0.01, 1.0)
+        self.anchor_conf_spin.setSingleStep(0.05)
+        self.anchor_conf_spin.setValue(ac)
+        self.anchor_conf_spin.setToolTip("How strongly to pull velocity to zero when anchored.")
+        self.anchor_conf_spin.valueChanged.connect(self._on_ekf_params_changed)
+        ekf_layout.addRow("Anchor Strength:", self.anchor_conf_spin)
+
         self.ekf_layout = ekf_layout
         self.ekf_rows = list(range(1, ekf_layout.rowCount()))
         self.fixed_height_rows = [4, 5]
@@ -1284,8 +1302,11 @@ class DataViewer(QMainWindow):
             self.ekf_measure_noise_slider.setValue(int(value * 10))
             self.ekf_measure_noise_slider.blockSignals(False)
             self.ekf_measure_noise_spin.blockSignals(True)
-            self.ekf_measure_noise_spin.setValue(value)
             self.ekf_measure_noise_spin.blockSignals(False)
+
+    def _on_ekf_params_changed(self):
+        self.config["ekf_anchor_enabled"] = self.ekf_anchor_cb.isChecked()
+        self.config["anchor_confidence"] = self.anchor_conf_spin.value()
         self._save_config()
         self.engine.update_config(self.config)
         self.engine.reset(self.imu_data)
@@ -2353,6 +2374,14 @@ class DataViewer(QMainWindow):
                 prev_ts = prev_frame["timestamp_ns"]
         dt = (ts - prev_ts) / 1e9 if prev_ts else 0.033
 
+        # Determine if we should anchor velocity (pre-calculate for update_ekf)
+        result_prev = self.vo_results[self.current_frame]
+        vo_score_val = result_prev.get("vo_score", 0.0) if result_prev else 0.0
+        min_vo_conf = self.min_vo_conf_spin.value()
+        conf_ok = (min_vo_conf == 0.0) or (vo_score_val >= min_vo_conf)
+        low_conf_mode = self.config.get("low_conf_mode", "both")
+        freeze_vo_path = not conf_ok and low_conf_mode in ("freeze_vo", "both")
+
         if self.vo_enabled_cb.isChecked() and not was_cached:
             vo_res, fused_pos, euler, speeds, denoised = self.engine.process_frame(
                 depth,
@@ -2393,13 +2422,20 @@ class DataViewer(QMainWindow):
 
             result = vo_res
             display_depth = self.current_depth
+            
+            # Re-calculate freeze_vo_path with the fresh result for map/caching
+            vo_score_val = result.get("vo_score", 0.0)
+            conf_ok = (min_vo_conf == 0.0) or (vo_score_val >= min_vo_conf)
+            freeze_vo_path = not conf_ok and low_conf_mode in ("freeze_vo", "both")
         else:
             result = self.vo_results[self.current_frame]
             self.current_conf = conf
             if result and self.ekf_enabled_cb.isChecked():
                 vo_pos = [result["pos_x"], result["pos_y"], result["pos_z"]]
                 fused_pos, euler, speeds = self.engine.update_ekf(
-                    gyro, accel, dt, vo_pos, result.get("vo_score", 0.0), timestamp_ns=ts
+                    gyro, accel, dt, vo_pos, result.get("vo_score", 0.0), 
+                    timestamp_ns=ts,
+                    stationary_anchor=self.ekf_anchor_cb.isChecked() and freeze_vo_path
                 )
                 self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
                 self.graph_data["pos_fused_y"][self.current_frame] = fused_pos[1]
@@ -2430,11 +2466,7 @@ class DataViewer(QMainWindow):
         invalid_mask = conf < conf_threshold
 
         # Update top-down map with latest VO result
-        vo_score = result.get("vo_score", 0.0) if result else 0.0
-        min_vo_conf = self.min_vo_conf_spin.value()
-        conf_ok = (min_vo_conf == 0.0) or (vo_score >= min_vo_conf)
-        low_conf_mode = self.config.get("low_conf_mode", "both")
-        freeze_vo_path = not conf_ok and low_conf_mode in ("freeze_vo", "both")
+        # (conf_ok and freeze_vo_path already calculated above)
 
         self._update_map(
             result,

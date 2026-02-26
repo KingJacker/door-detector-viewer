@@ -48,14 +48,14 @@ class ProcessingWorker(QObject):
             prev_ts = self.frame_loader.get_frame(i-1)["timestamp_ns"] if i > 0 else None
             dt = (ts - prev_ts) / 1e9 if prev_ts else 0.033
             
-            vo_res, fused_pos, euler, denoised = self.engine.process_frame(
+            vo_res, fused_pos, euler, speeds, denoised = self.engine.process_frame(
                 frame["depth"], frame["conf"], ts,
                 gyro, accel, dt,
                 use_denoised=self.engine.config.get("vo_use_denoised", False),
                 denoise_alpha=self.engine.config.get("denoise_alpha", 0.3)
             )
             
-            results.append((vo_res, fused_pos, euler))
+            results.append((vo_res, fused_pos, euler, speeds))
             self.progress.emit(i)
             
         self.engine.stop_logging()

@@ -140,7 +140,7 @@ class ProcessingEngine:
         self.prev_ekf_R = R_cur.copy()
         return self.denoised_depth
 
-    def update_ekf(self, gyro_raw, accel_raw, dt, vo_pos=None, vo_score=0.0, timestamp_ns=0):
+    def update_ekf(self, gyro_raw, accel_raw, dt, vo_pos=None, vo_score=0.0, timestamp_ns=0, encoder_speed=None, stationary_anchor=False):
         # 1. IMU conversion and remapping
         gyro_rads = np.deg2rad(gyro_raw)
         accel_ms2 = accel_raw * 9.81
@@ -154,11 +154,15 @@ class ProcessingEngine:
         # 2. EKF Predict
         self.ekf.predict(gyro_mapped, accel_mapped, dt)
 
-        # 3. EKF Update if VO position provided
-        if vo_pos is not None:
-            min_conf = self.config.get("min_vo_confidence", 0.0)
             if vo_score >= min_conf:
                 self.ekf.update(vo_pos, vo_score)
+
+        # 4. EKF Velocity Update (Encoder or Stationary Anchor)
+        if stationary_anchor:
+            # Tell EKF velocity is 0
+            self.ekf.update_velocity(0.0, 0.0, confidence=self.config.get("anchor_confidence", 0.5))
+        elif encoder_speed is not None:
+            self.ekf.update_velocity(encoder_speed, 0.0, confidence=1.0)
 
         fused_pos = self.ekf.get_position()
         euler = self.ekf.get_euler_angles()
@@ -189,6 +193,7 @@ class ProcessingEngine:
         dt,
         use_denoised=False,
         denoise_alpha=0.3,
+        encoder_speed=None,
     ):
         conf_threshold = self.config.get("conf_threshold", 10)
 
@@ -209,6 +214,19 @@ class ProcessingEngine:
             vo_pos = [vo_result["pos_x"], vo_result["pos_y"], vo_result["pos_z"]]
             vo_score = vo_result.get("vo_score", 0.0)
 
-        fused_pos, euler, speeds = self.update_ekf(gyro_raw, accel_raw, dt, vo_pos, vo_score, timestamp_ns)
+        # 3. Determine stationary anchor
+        stationary_anchor = False
+        if self.config.get("ekf_anchor_enabled", True):
+            # If VO score is low or VO says rejected_ratio is high (stationary detection proxy)
+            # Actually, let's use the VO score and min_conf
+            min_conf = self.config.get("min_vo_confidence", 0.0)
+            vo_score = vo_result.get("vo_score", 0.0)
+            if vo_score < min_conf:
+                stationary_anchor = True
+
+        fused_pos, euler, speeds = self.update_ekf(
+            gyro_raw, accel_raw, dt, vo_pos, vo_score, timestamp_ns, 
+            encoder_speed=encoder_speed, stationary_anchor=stationary_anchor
+        )
 
         return vo_result, fused_pos, euler, speeds, denoised

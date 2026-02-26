@@ -25,7 +25,8 @@ class ExtendedKalmanFilter:
         self.height_strength = 0.5
 
         self.process_noise = 0.1
-        self.measurement_noise = 1.0
+        self.measurement_noise = 1.0  # Position noise
+        self.velocity_noise = 0.5     # Velocity noise (encoders/anchoring)
 
         # Wheelchair motion model constraints
         self.max_speed = 2.0  # m/s — 0 = disabled
@@ -324,3 +325,55 @@ class ExtendedKalmanFilter:
             lat_speed = np.dot(vel, lat_dir)
             return fwd_speed, lat_speed
         return 0.0, 0.0
+
+    def update_velocity(self, v_fwd, v_lat=0.0, confidence=1.0):
+        """Update the EKF state with a velocity measurement (e.g. encoders or stationary anchor).
+
+        Args:
+            v_fwd: Forward velocity in m/s (relative to camera forward).
+            v_lat: Lateral velocity in m/s.
+            confidence: 0.0 to 1.0, scales measurement noise.
+        """
+        if confidence <= 1e-3:
+            return
+
+        # 1. Measurement matrix H_v
+        # We observation v_fwd and v_lat which are projections of the world velocity [vx, vy, vz]
+        # onto the camera's floor-aligned forward and lateral axes.
+        
+        # Camera forward in world frame [wx, wy, wz]
+        fw = self._quaternion_rotate(self.q, np.array([0.0, 0.0, 1.0]))
+        # Project to floor plane and normalize
+        ff = np.array([fw[0], fw[1], 0.0])
+        fn = np.linalg.norm(ff)
+        if fn < 1e-6:
+            return
+        ff /= fn
+        
+        # Lateral dir (right) is relative to forward on XY plane: [fx, fy, 0] -> [-fy, fx, 0]
+        lf = np.array([-ff[1], ff[0], 0.0])
+
+        # H_v is 2x6: [0, 0, 0, ff.x, ff.y, 0] and [0, 0, 0, lf.x, lf.y, 0]
+        Hv = np.zeros((2, 6))
+        Hv[0, 3:6] = ff
+        Hv[1, 3:6] = lf
+
+        # 2. Predicted measurement
+        z_pred = Hv @ self.state
+        z_meas = np.array([v_fwd, v_lat])
+        
+        y = z_meas - z_pred
+
+        # 3. Kalman Update
+        R = np.eye(2) * (self.velocity_noise / max(confidence, 1e-6))
+        
+        S = Hv @ self.P @ Hv.T + R
+        K = self.P @ Hv.T @ np.linalg.inv(S)
+
+        self.state = self.state + K @ y
+        
+        # Joseph form
+        I_KH = np.eye(6) - K @ Hv
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+
+        self._apply_motion_constraints()
