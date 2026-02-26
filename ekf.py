@@ -57,10 +57,41 @@ class ExtendedKalmanFilter:
         n = min(samples, len(accel_data))
         mean_accel = np.mean(accel_data[:n], axis=0)
         norm = np.linalg.norm(mean_accel)
-        if norm > 0:
+        if norm > 1e-6:
             self.up_direction = mean_accel / norm
+            # Optionally reset initial orientation so this up_direction points to world Z
+            self._init_q_from_up()
         else:
             self.up_direction = np.array([0.0, 0.0, 1.0])
+
+    def _init_q_from_up(self):
+        """Initialize quaternion self.q such that self.up_direction aligns with world Z-up.
+
+        Standard camera orientation (Z forward) is still rotated to world Y forward.
+        """
+        # 1. Align IMU 'up_direction' with World Z [0, 0, 1]
+        v_from = self.up_direction
+        v_to = np.array([0.0, 0.0, 1.0])
+
+        # Rotation between two vectors: q = [1 + dot(v1,v2), cross(v1,v2)]
+        dot = np.dot(v_from, v_to)
+        if dot < -0.999999:
+            # Opposite vectors
+            self.q = np.array([0.0, 1.0, 0.0, 0.0]) # 180 around X
+        else:
+            cross = np.cross(v_from, v_to)
+            s = np.sqrt((1 + dot) * 2)
+            self.q = np.array([s / 2, cross[0] / s, cross[1] / s, cross[2] / s])
+
+        self._normalize_quaternion()
+
+        # 2. Add the -90 degree rotation around camera-X (now in world space roughly)
+        # to point camera-Z (pinhole forward) to world-Y (forward).
+        # We rotate by -pi/2 around World X [1, 0, 0]
+        theta = -np.pi / 2
+        q_rot = np.array([np.cos(theta / 2), np.sin(theta / 2), 0, 0])
+        self.q = self._quaternion_multiply(q_rot, self.q)
+        self._normalize_quaternion()
 
     def set_fixed_height(self, enabled, height_meters=1.2, strength=0.5):
         self.fixed_height_enabled = enabled
@@ -149,7 +180,8 @@ class ExtendedKalmanFilter:
 
         # --- Rotate accel into world frame and remove gravity ---
         accel_world = self._quaternion_rotate(self.q, accel)
-        gravity = 9.81 * self.up_direction
+        # In world frame, gravity is ALWAYS [0, 0, 9.81] if world Z is up
+        gravity = np.array([0.0, 0.0, 9.81])
         accel_corrected = accel_world - gravity
 
         # --- State transition: constant-acceleration kinematics ---

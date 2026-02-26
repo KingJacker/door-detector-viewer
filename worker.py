@@ -58,4 +58,5 @@ class ProcessingWorker(QObject):
             results.append((vo_res, fused_pos))
             self.progress.emit(i)
             
+        self.engine.stop_logging()
         self.finished.emit(results)

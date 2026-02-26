@@ -13,6 +13,12 @@ class ProcessingEngine:
         self.denoised_depth = None
         self.prev_ekf_pos = None
         self.prev_ekf_R = None
+        self.log_file = None
+
+        # Axis mapping [x_idx, y_idx, z_idx], signs [x_s, y_s, z_s]
+        # Default: identity mapping
+        self.axis_mapping = [0, 1, 2]
+        self.axis_signs = [1, 1, 1]
 
     def reset(self, imu_data=None):
         self.vo.reset()
@@ -35,6 +41,29 @@ class ProcessingEngine:
         self.ekf.max_speed = config.get("max_speed", 2.0)
         self.ekf.max_rotation_speed = config.get("max_rotation_speed", 1.5)
         self.ekf.lateral_damping = config.get("lateral_damping", 0.1)
+
+        # Update mapping from config if present
+        if "imu_axis_mapping" in config:
+            self.axis_mapping = config["imu_axis_mapping"]
+        if "imu_axis_signs" in config:
+            self.axis_signs = config["imu_axis_signs"]
+
+    def start_logging(self, path):
+        if self.log_file:
+            self.log_file.close()
+        try:
+            self.log_file = open(path, "w")
+            self.log_file.write(
+                "timestamp_ns,dt,gyro_x,gyro_y,gyro_z,acc_x,acc_y,acc_z,fused_x,fused_y,fused_z,q_w,q_x,q_y,q_z\n"
+            )
+        except Exception as e:
+            print(f"Failed to start EKF logging: {e}")
+            self.log_file = None
+
+    def stop_logging(self):
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
 
     def compute_denoised(self, depth, conf, conf_threshold, denoise_alpha):
         H, W = depth.shape
@@ -111,16 +140,19 @@ class ProcessingEngine:
         self.prev_ekf_R = R_cur.copy()
         return self.denoised_depth
 
-    def update_ekf(self, gyro_raw, accel_raw, dt, vo_pos=None, vo_score=0.0):
+    def update_ekf(self, gyro_raw, accel_raw, dt, vo_pos=None, vo_score=0.0, timestamp_ns=0):
         # 1. IMU conversion and remapping
         gyro_rads = np.deg2rad(gyro_raw)
         accel_ms2 = accel_raw * 9.81
 
-        if self.config.get("gyro_axis_map", "ZYX") == "ZYX":
-            gyro_rads = gyro_rads[[2, 1, 0]]
+        # Apply axis mapping and signs
+        m = self.axis_mapping
+        s = self.axis_signs
+        gyro_mapped = np.array([gyro_rads[m[0]] * s[0], gyro_rads[m[1]] * s[1], gyro_rads[m[2]] * s[2]])
+        accel_mapped = np.array([accel_ms2[m[0]] * s[0], accel_ms2[m[1]] * s[1], accel_ms2[m[2]] * s[2]])
 
         # 2. EKF Predict
-        self.ekf.predict(gyro_rads, accel_ms2, dt)
+        self.ekf.predict(gyro_mapped, accel_mapped, dt)
 
         # 3. EKF Update if VO position provided
         if vo_pos is not None:
@@ -128,7 +160,21 @@ class ProcessingEngine:
             if vo_score >= min_conf:
                 self.ekf.update(vo_pos, vo_score)
 
-        return self.ekf.get_position()
+        fused_pos = self.ekf.get_position()
+
+        # 4. Logging
+        if self.log_file:
+            q = self.ekf.q
+            g = gyro_mapped
+            a = accel_mapped
+            p = fused_pos
+            self.log_file.write(
+                f"{timestamp_ns},{dt:.6f},{g[0]:.6f},{g[1]:.6f},{g[2]:.6f},"
+                f"{a[0]:.6f},{a[1]:.6f},{a[2]:.6f},{p[0]:.6f},{p[1]:.6f},{p[2]:.6f},"
+                f"{q[0]:.6f},{q[1]:.6f},{q[2]:.6f},{q[3]:.6f}\n"
+            )
+
+        return fused_pos
 
     def process_frame(
         self,
@@ -160,6 +206,6 @@ class ProcessingEngine:
             vo_pos = [vo_result["pos_x"], vo_result["pos_y"], vo_result["pos_z"]]
             vo_score = vo_result.get("vo_score", 0.0)
 
-        fused_pos = self.update_ekf(gyro_raw, accel_raw, dt, vo_pos, vo_score)
+        fused_pos = self.update_ekf(gyro_raw, accel_raw, dt, vo_pos, vo_score, timestamp_ns)
 
         return vo_result, fused_pos, denoised

@@ -1111,19 +1111,40 @@ class DataViewer(QMainWindow):
         self.imu_filter_cb.toggled.connect(self._on_imu_filter_changed)
         imu_layout.addRow(self.imu_filter_cb)
 
-        self.gyro_map_combo = QComboBox()
-        self.gyro_map_combo.addItems(["XYZ (standard)", "ZYX (swap X\u2194Z)"])
-        saved_gyro_map = self.config.get("gyro_axis_map", "ZYX")
-        self.gyro_map_combo.setCurrentText(
-            "ZYX (swap X\u2194Z)" if saved_gyro_map == "ZYX" else "XYZ (standard)"
-        )
-        self.gyro_map_combo.setToolTip(
-            "Remap gyroscope axes to match the accelerometer frame.\n"
-            "Use 'ZYX' when gyro_x is the yaw axis but acc_z is the gravity axis\n"
-            "(the default for this BMI160 mounting orientation)."
-        )
-        self.gyro_map_combo.currentTextChanged.connect(self._on_gyro_map_changed)
-        imu_layout.addRow("Gyro Axes:", self.gyro_map_combo)
+        self.imu_mapping_combo = QComboBox()
+        self.imu_mapping_combo.addItems(["XYZ (Standard)", "ZYX (Swap X\u2194Z)", "XZY", "YXZ", "YZX", "ZXY"])
+        mapping_labels = {
+            (0, 1, 2): "XYZ (Standard)",
+            (2, 1, 0): "ZYX (Swap X\u2194Z)",
+            (0, 2, 1): "XZY",
+            (1, 0, 2): "YXZ",
+            (1, 2, 0): "YZX",
+            (2, 0, 1): "ZXY",
+        }
+        saved_m = tuple(self.config.get("imu_axis_mapping", [2, 1, 0])) # Default to ZYX for this project
+        self.imu_mapping_combo.setCurrentText(mapping_labels.get(saved_m, "ZYX (Swap X\u2194Z)"))
+        self.imu_mapping_combo.currentTextChanged.connect(self._on_imu_mapping_changed)
+        imu_layout.addRow("Axis Mapping:", self.imu_mapping_combo)
+
+        # Axis Signs UI
+        h_signs = QHBoxLayout()
+        self.sign_x_cb = QCheckBox("X")
+        self.sign_y_cb = QCheckBox("Y")
+        self.sign_z_cb = QCheckBox("Z")
+        signs = self.config.get("imu_axis_signs", [1, 1, 1])
+        self.sign_x_cb.setChecked(signs[0] > 0)
+        self.sign_y_cb.setChecked(signs[1] > 0)
+        self.sign_z_cb.setChecked(signs[2] > 0)
+        for cb in [self.sign_x_cb, self.sign_y_cb, self.sign_z_cb]:
+            cb.toggled.connect(self._on_imu_mapping_changed)
+            h_signs.addWidget(cb)
+        imu_layout.addRow("Axis Directions:", h_signs)
+
+        self.log_ekf_cb = QCheckBox("Log EKF data to CSV")
+        self.log_ekf_cb.setChecked(self.config.get("log_ekf", True))
+        self.log_ekf_cb.setToolTip("Save raw IMU, fused pose and orientation to 'ekf_debug.log' in session folder.")
+        self.log_ekf_cb.toggled.connect(self._on_log_ekf_toggled)
+        imu_layout.addRow(self.log_ekf_cb)
 
         ia = self.config.get("imu_filter_alpha", 0.8)
         self.imu_alpha_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1309,30 +1330,39 @@ class DataViewer(QMainWindow):
         self._save_config()
         self.update_display()
 
-    def _apply_gyro_remap(self, gyro_rads):
-        """Remap gyroscope axes to match the accelerometer frame.
+    def _on_imu_mapping_changed(self):
+        mapping_vals = {
+            "XYZ (Standard)": [0, 1, 2],
+            "ZYX (Swap X\u2194Z)": [2, 1, 0],
+            "XZY": [0, 2, 1],
+            "YXZ": [1, 0, 2],
+            "YZX": [1, 2, 0],
+            "ZXY": [2, 0, 1],
+        }
+        self.config["imu_axis_mapping"] = mapping_vals.get(self.imu_mapping_combo.currentText(), [0, 1, 2])
+        self.config["imu_axis_signs"] = [
+            1 if self.sign_x_cb.isChecked() else -1,
+            1 if self.sign_y_cb.isChecked() else -1,
+            1 if self.sign_z_cb.isChecked() else -1,
+        ]
+        self._save_config()
+        self.engine.update_config(self.config)
+        self.engine.reset(self.imu_data)
+        self.update_display()
 
-        In this dataset the BMI160 gyro X axis aligns with the physical vertical
-        (yaw), while the accelerometer Z axis measures gravity (also vertical).
-        Swapping X↔Z makes both sensors share the same physical axis convention.
-        """
-        if self.config.get("gyro_axis_map", "ZYX") == "ZYX":
-            return gyro_rads[[2, 1, 0]]  # swap X and Z
-        return gyro_rads
+    def _on_log_ekf_toggled(self, checked):
+        self.config["log_ekf"] = checked
+        self._save_config()
+        if checked and self.session_dir:
+            self.engine.start_logging(self.session_dir / "ekf_debug.log")
+        else:
+            self.engine.stop_logging()
 
     def _on_vo_use_denoised_changed(self, checked):
         self.config["vo_use_denoised"] = checked
         self._save_config()
         # VO must recompute since its input changes
         self._recompute_vo()
-
-    def _on_gyro_map_changed(self, text):
-        self.config["gyro_axis_map"] = "ZYX" if "ZYX" in text else "XYZ"
-        self._save_config()
-        # Reset EKF so it re-integrates from scratch with the new axis mapping
-        self.ekf.reset()
-        self._init_ekf_from_imu()
-        self.update_display()
 
     def _on_denoise_alpha_changed(self, alpha):
         self.denoise_alpha = alpha
@@ -1997,6 +2027,11 @@ class DataViewer(QMainWindow):
 
         self.engine.reset(self.imu_data)
 
+        if self.log_ekf_cb.isChecked():
+            self.engine.start_logging(self.session_dir / "ekf_debug.log")
+        else:
+            self.engine.stop_logging()
+
         # Reset map and denoised state
         self._clear_map()
 
@@ -2477,6 +2512,8 @@ class DataViewer(QMainWindow):
         # Use a fresh engine instance for the worker to avoid thread safety issues
         worker_engine = ProcessingEngine(self.config)
         worker_engine.reset(self.imu_data)
+        if self.log_ekf_cb.isChecked():
+            worker_engine.start_logging(self.session_dir / "ekf_debug_worker.log")
 
         self.process_thread = QThread()
         self.process_worker = ProcessingWorker(
