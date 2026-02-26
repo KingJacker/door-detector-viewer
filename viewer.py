@@ -119,6 +119,8 @@ class DataViewer(QMainWindow):
             "ekf_roll": [],
             "ekf_pitch": [],
             "ekf_yaw": [],
+            "ekf_fwd_speed": [],
+            "ekf_lat_speed": [],
         }
 
         self.graph_colors = {
@@ -150,6 +152,8 @@ class DataViewer(QMainWindow):
             "ekf_roll": "#ff5500",
             "ekf_pitch": "#00ff55",
             "ekf_yaw": "#5500ff",
+            "ekf_fwd_speed": "#ffaa00",
+            "ekf_lat_speed": "#00aaff",
         }
 
         self._setup_ui()
@@ -436,6 +440,8 @@ class DataViewer(QMainWindow):
             ("ekf_roll", "EKF Roll"),
             ("ekf_pitch", "EKF Pitch"),
             ("ekf_yaw", "EKF Yaw"),
+            ("ekf_fwd_speed", "EKF Fwd Speed"),
+            ("ekf_lat_speed", "EKF Lat Speed"),
         ]
         saved_series = self.config.get("graph_series", {})
         for key, label in series_options:
@@ -446,6 +452,12 @@ class DataViewer(QMainWindow):
             cb.setChecked(saved_series.get(key, default_on))
             cb.toggled.connect(self._on_series_toggled)
             self.series_cbs[key] = cb
+            if key == "ekf_roll":
+                cb.setToolTip("Absolute Roll in World Frame (-90° is Level Forward)")
+            elif key == "ekf_pitch":
+                cb.setToolTip("Absolute Pitch in World Frame")
+            elif key == "ekf_yaw":
+                cb.setToolTip("Absolute Yaw in World Frame")
 
             value_label = QLabel("0.0")
             value_label.setStyleSheet(f"QLabel {{ color: {color}; }}")
@@ -2086,7 +2098,7 @@ class DataViewer(QMainWindow):
                 self.graph_data[key] = list(self.imu_interpolated[key])
             elif key in filt_keys:
                 self.graph_data[key] = [0.0] * num_frames
-            elif key in ["pos_fused_x", "pos_fused_y", "pos_fused_z", "ekf_roll", "ekf_pitch", "ekf_yaw"]:
+            elif key in ["pos_fused_x", "pos_fused_y", "pos_fused_z", "ekf_roll", "ekf_pitch", "ekf_yaw", "ekf_fwd_speed", "ekf_lat_speed"]:
                 self.graph_data[key] = [0.0] * num_frames
             else:
                 self.graph_data[key] = [0] * num_frames
@@ -2118,7 +2130,7 @@ class DataViewer(QMainWindow):
             "vo_score",
         ]:
             self.graph_data[key] = [0] * num_frames
-        for key in ["pos_fused_x", "pos_fused_y", "pos_fused_z"]:
+        for key in ["pos_fused_x", "pos_fused_y", "pos_fused_z", "ekf_roll", "ekf_pitch", "ekf_yaw", "ekf_fwd_speed", "ekf_lat_speed"]:
             self.graph_data[key] = [0.0] * num_frames
         self.update_display()
 
@@ -2342,7 +2354,7 @@ class DataViewer(QMainWindow):
         dt = (ts - prev_ts) / 1e9 if prev_ts else 0.033
 
         if self.vo_enabled_cb.isChecked() and not was_cached:
-            vo_res, fused_pos, euler, denoised = self.engine.process_frame(
+            vo_res, fused_pos, euler, speeds, denoised = self.engine.process_frame(
                 depth,
                 conf,
                 ts,
@@ -2376,6 +2388,8 @@ class DataViewer(QMainWindow):
             self.graph_data["ekf_roll"][self.current_frame] = euler[0]
             self.graph_data["ekf_pitch"][self.current_frame] = euler[1]
             self.graph_data["ekf_yaw"][self.current_frame] = euler[2]
+            self.graph_data["ekf_fwd_speed"][self.current_frame] = speeds[0]
+            self.graph_data["ekf_lat_speed"][self.current_frame] = speeds[1]
 
             result = vo_res
             display_depth = self.current_depth
@@ -2384,7 +2398,7 @@ class DataViewer(QMainWindow):
             self.current_conf = conf
             if result and self.ekf_enabled_cb.isChecked():
                 vo_pos = [result["pos_x"], result["pos_y"], result["pos_z"]]
-                fused_pos, euler = self.engine.update_ekf(
+                fused_pos, euler, speeds = self.engine.update_ekf(
                     gyro, accel, dt, vo_pos, result.get("vo_score", 0.0), timestamp_ns=ts
                 )
                 self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
@@ -2393,6 +2407,8 @@ class DataViewer(QMainWindow):
                 self.graph_data["ekf_roll"][self.current_frame] = euler[0]
                 self.graph_data["ekf_pitch"][self.current_frame] = euler[1]
                 self.graph_data["ekf_yaw"][self.current_frame] = euler[2]
+                self.graph_data["ekf_fwd_speed"][self.current_frame] = speeds[0]
+                self.graph_data["ekf_lat_speed"][self.current_frame] = speeds[1]
 
             # If we are in denoised mode but result was cached, we ideally want to show denoised depth.
             # However, denoising is temporal and stateful. Since we are in 'else', we are either:
@@ -2558,29 +2574,31 @@ class DataViewer(QMainWindow):
         for i, res in enumerate(results):
             frame_idx = min_idx + i
             if res is not None:
-                vo_res, fused_pos, euler = res
-                self.vo_results[frame_idx] = vo_res
-                if vo_res:
-                    for key in [
-                        "tracked",
-                        "rejected",
-                        "ratio",
-                        "pos_x",
-                        "pos_y",
-                        "pos_z",
-                        "mean_depth",
-                        "mean_conf",
-                        "fps",
-                        "vo_score",
-                    ]:
-                        self.graph_data[key][frame_idx] = vo_res.get(key, 0)
+                vo_res, fused_pos, euler, speeds = res
+            self.vo_results[frame_idx] = vo_res
+            if vo_res:
+                for key in [
+                    "tracked",
+                    "rejected",
+                    "ratio",
+                    "pos_x",
+                    "pos_y",
+                    "pos_z",
+                    "mean_depth",
+                    "mean_conf",
+                    "fps",
+                    "vo_score",
+                ]:
+                    self.graph_data[key][frame_idx] = vo_res.get(key, 0)
 
-                self.graph_data["pos_fused_x"][frame_idx] = fused_pos[0]
-                self.graph_data["pos_fused_y"][frame_idx] = fused_pos[1]
-                self.graph_data["pos_fused_z"][frame_idx] = fused_pos[2]
-                self.graph_data["ekf_roll"][frame_idx] = euler[0]
-                self.graph_data["ekf_pitch"][frame_idx] = euler[1]
-                self.graph_data["ekf_yaw"][frame_idx] = euler[2]
+            self.graph_data["pos_fused_x"][frame_idx] = fused_pos[0]
+            self.graph_data["pos_fused_y"][frame_idx] = fused_pos[1]
+            self.graph_data["pos_fused_z"][frame_idx] = fused_pos[2]
+            self.graph_data["ekf_roll"][frame_idx] = euler[0]
+            self.graph_data["ekf_pitch"][frame_idx] = euler[1]
+            self.graph_data["ekf_yaw"][frame_idx] = euler[2]
+            self.graph_data["ekf_fwd_speed"][frame_idx] = speeds[0]
+            self.graph_data["ekf_lat_speed"][frame_idx] = speeds[1]
 
         self._update_graph()
         self.update_display()

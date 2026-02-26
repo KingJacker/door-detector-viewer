@@ -1,12 +1,12 @@
 {
-  "conf_threshold": 35,
+  "conf_threshold": 25,
   "show_masked": false,
   "view_mode": "depth",
   "playback_speed": 30,
   "bilateral_enabled": false,
   "median_enabled": true,
   "bilateral_d": 9,
-  "bilateral_sigma_color": 200,
+  "bilateral_sigma_color": 50,
   "bilateral_sigma_space": 20,
   "median_k": 5,
   "detector_threshold": 5,
@@ -19,7 +19,7 @@
   "last_session": "20260219_150244",
   "range_min": 0,
   "range_max": 1313,
-  "last_frame": 1268,
+  "last_frame": 670,
   "gyro_axis_map": "XYZ",
   "ekf_enabled": true,
   "fixed_height_enabled": true,
@@ -49,15 +49,17 @@
     "acc_x_filt": false,
     "acc_y_filt": false,
     "acc_z_filt": false,
-    "gyro_x_filt": true,
+    "gyro_x_filt": false,
     "gyro_y_filt": false,
     "gyro_z_filt": false,
     "vo_score": true,
-    "ekf_roll": true,
+    "ekf_roll": false,
     "ekf_pitch": false,
-    "ekf_yaw": true
+    "ekf_yaw": false,
+    "ekf_fwd_speed": true,
+    "ekf_lat_speed": false
   },
-  "vo_use_denoised": false,
+  "vo_use_denoised": true,
   "min_vo_confidence": 0.2,
   "ekf_process_noise": 0.01,
   "max_speed": 1.0,
@@ -70,7 +72,7 @@
   "point_cloud_pixel_skip": 4,
   "constrain_max_range": true,
   "constrain_to_front": true,
-  "height_strength": 0.52,
+  "height_strength": 0.51,
   "use_fov_mode": true,
   "fov_x_deg": 58.5,
   "fov_y_deg": 45.6,
@@ -88,5 +90,6 @@
     1,
     1,
     1
-  ]
+  ],
+  "denoise_alpha": 0.32
 }

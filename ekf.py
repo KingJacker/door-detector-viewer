@@ -214,6 +214,17 @@ class ExtendedKalmanFilter:
         self.last_accel = accel
         self.last_dt = dt
 
+        if self.fixed_height_enabled:
+            current_z = self.state[2]
+            # Pull Z back to fixed_height based on strength
+            self.state[2] = (
+                current_z * (1 - self.height_strength)
+                + self.fixed_height * self.height_strength
+            )
+            # Also zero out vertical velocity to prevent continued "falling"
+            current_vz = self.state[5]
+            self.state[5] = current_vz * (1 - self.height_strength)
+
         self._apply_motion_constraints()
 
     def update(self, vo_position, vo_confidence=1.0):
@@ -252,12 +263,6 @@ class ExtendedKalmanFilter:
         I_KH = np.eye(6) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R_matrix @ K.T
 
-        if self.fixed_height_enabled:
-            current_z = self.state[2]
-            self.state[2] = (
-                current_z * (1 - self.height_strength)
-                + self.fixed_height * self.height_strength
-            )
 
         self._apply_motion_constraints()
 
@@ -301,3 +306,21 @@ class ExtendedKalmanFilter:
         yaw = np.arctan2(siny_cosp, cosy_cosp)
 
         return np.degrees(roll), np.degrees(pitch), np.degrees(yaw)
+
+    def get_speeds(self):
+        """Get (forward_speed, lateral_speed) in m/s relative to camera orientation."""
+        vel = self.state[3:6]
+        # Camera forward = [0, 0, 1] in camera frame, rotated to world frame
+        forward_world = self._quaternion_rotate(self.q, np.array([0.0, 0.0, 1.0]))
+        # Project onto the floor plane (Z=up → XY is floor)
+        forward_floor = np.array([forward_world[0], forward_world[1], 0.0])
+        fn = np.linalg.norm(forward_floor)
+        if fn > 1e-6:
+            forward_floor /= fn
+            fwd_speed = np.dot(vel, forward_floor)
+            # Lateral is relative to forward on XY plane
+            # [fx, fy, 0] rotated 90 deg around Z is [-fy, fx, 0]
+            lat_dir = np.array([-forward_floor[1], forward_floor[0], 0.0])
+            lat_speed = np.dot(vel, lat_dir)
+            return fwd_speed, lat_speed
+        return 0.0, 0.0
