@@ -23,7 +23,9 @@ class VisualOdometry:
         self.prev_depth = None
 
         self.position = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-        self.R_world = np.eye(3)
+        # Initial rotation: camera Z (forward) -> world Y (forward)
+        # -90° rotation around X axis: [1,0,0; 0,0,1; 0,-1,0]
+        self.R_world = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
 
         self.tracked_count = 0
         self.rejected_count = 0

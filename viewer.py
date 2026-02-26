@@ -59,9 +59,9 @@ class DataViewer(QMainWindow):
 
         self.frame_loader = AsyncFrameLoader()
         self.engine = ProcessingEngine(self.config)
-        
+
         self.vo_results = []
-        
+
         # Apply saved EKF parameters to engine's EKF
         self.engine.update_config(self.config)
 
@@ -180,6 +180,7 @@ class DataViewer(QMainWindow):
             "fixed_height": 1.2,
             "height_strength": 0.5,
             "max_speed": 2.0,
+            "max_rotation_speed": 1.5,
             "lateral_damping": 0.1,
             "min_vo_confidence": 0.0,
             "low_conf_mode": "both",
@@ -195,6 +196,13 @@ class DataViewer(QMainWindow):
             "map_show_fused": True,
             "map_show_pts": False,
             "map_max_pts": 20000,
+            "use_ekf_pose_for_points": True,
+            "dense_point_cloud": False,
+            "point_cloud_pixel_skip": 4,
+            "constrain_max_range": True,
+            "constrain_to_front": True,
+            "max_range_mm": 4000,
+            "camera_fov_deg": 70,
             # Graph series visibility
             "graph_series": {
                 "tracked": True,
@@ -258,10 +266,36 @@ class DataViewer(QMainWindow):
 
         camera_group = QGroupBox("Camera")
         camera_layout = QFormLayout(camera_group)
-        camera_layout.addRow(
-            "Focal:", QLabel(f"{self.config.get('focal_length_mm', 3.4)}mm")
+
+        # Focal length (configurable)
+        self.focal_spin = QDoubleSpinBox()
+        self.focal_spin.setRange(1.0, 10.0)
+        self.focal_spin.setSingleStep(0.1)
+        self.focal_spin.setValue(self.config.get("focal_length_mm", 3.4))
+        self.focal_spin.setSuffix(" mm")
+        self.focal_spin.valueChanged.connect(self._on_camera_params_changed)
+        camera_layout.addRow("Focal:", self.focal_spin)
+
+        # Sensor size (configurable)
+        self.sensor_combo = QComboBox()
+        self.sensor_combo.addItems(["1/6", "1/4", "1/3", "1/2.3", "1/2", "2/3", "1"])
+        self.sensor_combo.setCurrentText(self.config.get("sensor_size", "1/6"))
+        self.sensor_combo.currentTextChanged.connect(self._on_camera_params_changed)
+        camera_layout.addRow("Sensor:", self.sensor_combo)
+
+        # Max range (configurable)
+        self.max_range_spin = QSpinBox()
+        self.max_range_spin.setRange(1000, 10000)
+        self.max_range_spin.setSingleStep(500)
+        self.max_range_spin.setValue(self.config.get("max_range_mm", 4000))
+        self.max_range_spin.setSuffix(" mm")
+        self.max_range_spin.setToolTip(
+            "Maximum depth range for point cloud projection and FOV cone.\n"
+            "Larger values show more distant points but may include noise."
         )
-        camera_layout.addRow("Sensor:", QLabel(self.config.get("sensor_size", "1/6")))
+        self.max_range_spin.valueChanged.connect(self._on_max_range_changed)
+        camera_layout.addRow("Max range:", self.max_range_spin)
+
         layout.addWidget(camera_group)
 
         series_group = QGroupBox("Graph Series")
@@ -368,6 +402,8 @@ class DataViewer(QMainWindow):
         self.map_widget.setLabel("left", "Y (m)")
         self.map_widget.showGrid(x=True, y=True, alpha=0.3)
         self.map_widget.setAspectLocked(True)
+        # Add padding so FOV cone and points can extend outside visible area
+        self.map_widget.getViewBox().setDefaultPadding(0.1)
         self.map_widget.addLegend()
 
         # Path curves
@@ -387,6 +423,13 @@ class DataViewer(QMainWindow):
             size=2, brush=pg.mkBrush(100, 200, 255, 80), pen=pg.mkPen(None)
         )
         self.map_widget.addItem(self.map_depth_scatter)
+
+        # Camera FOV cone (70° default, gray with opacity)
+        self.map_camera_fov = pg.PlotDataItem(
+            pen=pg.mkPen((128, 128, 128, 100), width=1),
+            fill=pg.mkBrush((128, 128, 128, 50)),
+        )
+        self.map_widget.addItem(self.map_camera_fov)
 
         map_layout.addWidget(self.map_widget)
 
@@ -423,6 +466,54 @@ class DataViewer(QMainWindow):
         map_ctrl.addWidget(self.map_clear_btn)
         map_ctrl.addStretch()
         map_layout.addLayout(map_ctrl)
+
+        # Map options row 2 - point cloud settings
+        map_opts2 = QHBoxLayout()
+
+        self.use_ekf_pose_cb = QCheckBox("Use EKF pose")
+        self.use_ekf_pose_cb.setChecked(
+            self.config.get("use_ekf_pose_for_points", True)
+        )
+        self.use_ekf_pose_cb.setToolTip(
+            "Use fused EKF pose for point projection (smoother).\n"
+            "Uncheck to use raw VO pose (more jittery)."
+        )
+        self.use_ekf_pose_cb.toggled.connect(self._on_point_cloud_options_changed)
+        map_opts2.addWidget(self.use_ekf_pose_cb)
+
+        self.dense_cloud_cb = QCheckBox("Dense cloud")
+        self.dense_cloud_cb.setChecked(self.config.get("dense_point_cloud", False))
+        self.dense_cloud_cb.setToolTip(
+            "Project all depth pixels (dense) vs tracked features only (sparse).\n"
+            "Dense mode works without VO enabled."
+        )
+        self.dense_cloud_cb.toggled.connect(self._on_point_cloud_options_changed)
+        map_opts2.addWidget(self.dense_cloud_cb)
+
+        map_opts2.addWidget(QLabel("Skip:"))
+        self.pixel_skip_spin = QSpinBox()
+        self.pixel_skip_spin.setRange(1, 10)
+        self.pixel_skip_spin.setValue(self.config.get("point_cloud_pixel_skip", 4))
+        self.pixel_skip_spin.setToolTip(
+            "Downsample dense cloud: 1=all pixels, 4=every 4th, etc."
+        )
+        self.pixel_skip_spin.valueChanged.connect(self._on_point_cloud_options_changed)
+        map_opts2.addWidget(self.pixel_skip_spin)
+
+        self.constrain_range_cb = QCheckBox("Max 4m")
+        self.constrain_range_cb.setChecked(self.config.get("constrain_max_range", True))
+        self.constrain_range_cb.setToolTip("Filter points beyond 4000mm sensor limit")
+        self.constrain_range_cb.toggled.connect(self._on_point_cloud_options_changed)
+        map_opts2.addWidget(self.constrain_range_cb)
+
+        self.constrain_front_cb = QCheckBox("Front only")
+        self.constrain_front_cb.setChecked(self.config.get("constrain_to_front", True))
+        self.constrain_front_cb.setToolTip("Filter points behind camera (Z <= 0)")
+        self.constrain_front_cb.toggled.connect(self._on_point_cloud_options_changed)
+        map_opts2.addWidget(self.constrain_front_cb)
+
+        map_opts2.addStretch()
+        map_layout.addLayout(map_opts2)
 
         self.center_tabs.addTab(map_tab, "Top-Down Map")
         layout.addWidget(self.center_tabs, 3)
@@ -588,7 +679,9 @@ class DataViewer(QMainWindow):
         vo_layout.addRow("Stationary (px):", self.vo_stationary_spin)
 
         self.process_btn = QPushButton("Process Selected Range")
-        self.process_btn.setToolTip("Process the selected frame range in the background.")
+        self.process_btn.setToolTip(
+            "Process the selected frame range in the background."
+        )
         self.process_btn.clicked.connect(self._on_process_range_clicked)
         vo_layout.addRow(self.process_btn)
 
@@ -828,6 +921,24 @@ class DataViewer(QMainWindow):
         )
         self.max_speed_spin.valueChanged.connect(self._on_max_speed_changed)
         ekf_layout.addRow("Max Speed:", self.max_speed_spin)
+
+        mrs = self.config.get("max_rotation_speed", 1.5)
+        self.max_rot_speed_spin = QDoubleSpinBox()
+        self.max_rot_speed_spin.setRange(0.0, 5.0)
+        self.max_rot_speed_spin.setSingleStep(0.1)
+        self.max_rot_speed_spin.setDecimals(1)
+        self.max_rot_speed_spin.setValue(mrs)
+        self.max_rot_speed_spin.setSuffix(" rad/s")
+        self.max_rot_speed_spin.setToolTip(
+            "Maximum allowed rotation speed.\n"
+            "Clamps angular velocity before EKF quaternion integration.\n"
+            "~1.5 rad/s (86°/s) is reasonable for electric wheelchairs.\n"
+            "Set to 0 to disable."
+        )
+        self.max_rot_speed_spin.valueChanged.connect(
+            self._on_max_rotation_speed_changed
+        )
+        ekf_layout.addRow("Max Rot Speed:", self.max_rot_speed_spin)
 
         ld = self.config.get("lateral_damping", 0.1)
         self.lateral_damping_spin = QDoubleSpinBox()
@@ -1070,6 +1181,12 @@ class DataViewer(QMainWindow):
         self._save_config()
         self.update_display()
 
+    def _on_max_rotation_speed_changed(self, value):
+        self.config["max_rotation_speed"] = value
+        self.engine.update_config(self.config)
+        self._save_config()
+        self.update_display()
+
     def _on_lateral_damping_changed(self, value):
         self.config["lateral_damping"] = value
         self.engine.update_config(self.config)
@@ -1156,7 +1273,6 @@ class DataViewer(QMainWindow):
             self._recompute_imu_filter()
         self.update_display()
 
-
     def _recompute_imu_filter(self):
         alpha = self.imu_filter_alpha
         keys = ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"]
@@ -1186,6 +1302,17 @@ class DataViewer(QMainWindow):
         self.config["map_max_pts"] = value
         self._save_config()
 
+    def _on_point_cloud_options_changed(self, _=None):
+        """Handle changes to point cloud display options."""
+        self.config["use_ekf_pose_for_points"] = self.use_ekf_pose_cb.isChecked()
+        self.config["dense_point_cloud"] = self.dense_cloud_cb.isChecked()
+        self.config["point_cloud_pixel_skip"] = self.pixel_skip_spin.value()
+        self.config["constrain_max_range"] = self.constrain_range_cb.isChecked()
+        self.config["constrain_to_front"] = self.constrain_front_cb.isChecked()
+        self._save_config()
+        # Trigger update to show changes
+        self.update_display()
+
     def _clear_paths(self):
         """Clear path curves only — keeps the accumulated depth point cloud."""
         self.map_vo_positions.clear()
@@ -1199,7 +1326,66 @@ class DataViewer(QMainWindow):
         self._clear_paths()
         self.map_depth_points.clear()
         self.map_depth_scatter.setData([], [])
+        self.map_camera_fov.setData([], [])
 
+    def _update_camera_fov(self, cx, cy, R_w=None):
+        """Update the camera FOV cone visualization.
+
+        Draws a triangular cone representing the camera's field of view in the
+        top-down map view. The cone extends from the camera position forward
+        along the camera's viewing direction to the configured max range.
+
+        Args:
+            cx, cy: Camera position in world coordinates (X=right, Y=forward)
+            R_w: Camera-to-world rotation matrix (3x3). If None, assumes
+                 camera points along +Y (forward in world frame).
+        """
+        fov_deg = self.config.get("camera_fov_deg", 70.0)
+        max_range_m = self.config.get("max_range_mm", 4000) / 1000.0
+
+        # Get camera forward direction in world X-Y plane
+        # Camera's forward vector in camera frame is [0, 0, 1] (Z axis)
+        # Transform to world frame: forward_world = R_w @ [0, 0, 1]
+        if R_w is not None:
+            forward_world = R_w[:, 2]  # Third column is Z axis in world frame
+            # Project onto X-Y plane (ignore Z component for heading)
+            fx, fy = forward_world[0], forward_world[1]
+            # Normalize
+            norm = np.sqrt(fx**2 + fy**2)
+            if norm > 0.001:
+                fx, fy = fx / norm, fy / norm
+            else:
+                fx, fy = 0.0, 1.0  # Default: pointing forward
+        else:
+            fx, fy = 0.0, 1.0  # Default: pointing along +Y
+
+        # Calculate cone edges at half FOV angle
+        half_fov = np.radians(fov_deg / 2.0)
+        cos_hf = np.cos(half_fov)
+        sin_hf = np.sin(half_fov)
+
+        # Rotate forward vector by ±half_fov to get cone edges
+        # For left edge: rotate forward by +half_fov
+        left_fx = fx * cos_hf - fy * sin_hf
+        left_fy = fx * sin_hf + fy * cos_hf
+
+        # For right edge: rotate forward by -half_fov
+        right_fx = fx * cos_hf + fy * sin_hf
+        right_fy = -fx * sin_hf + fy * cos_hf
+
+        # Calculate cone tip points (max range)
+        left_tip_x = cx + left_fx * max_range_m
+        left_tip_y = cy + left_fy * max_range_m
+
+        right_tip_x = cx + right_fx * max_range_m
+        right_tip_y = cy + right_fy * max_range_m
+
+        # Define polygon vertices: camera position, left tip, right tip
+        # Closing back to camera position
+        xs = [cx, left_tip_x, right_tip_x, cx]
+        ys = [cy, left_tip_y, right_tip_y, cy]
+
+        self.map_camera_fov.setData(xs, ys)
 
     def _update_map(
         self, result, depth, conf, conf_threshold, is_fresh=True, freeze_vo=False
@@ -1213,24 +1399,23 @@ class DataViewer(QMainWindow):
                    mode is active. Prevents new VO positions from being added to
                    the path, keeping the last known valid position.
         """
-        if result is None:
-            return
+        # Handle VO paths only if we have a result
+        if result is not None:
+            pos_x = result.get("pos_x", 0.0)
+            pos_y = result.get("pos_y", 0.0)
+            # Z is up per IMU convention, so the floor plane is X (right) vs Y (forward)
 
-        pos_x = result.get("pos_x", 0.0)
-        pos_y = result.get("pos_y", 0.0)
-        # Z is up per IMU convention, so the floor plane is X (right) vs Y (forward)
-
-        # VO path — only advance when not frozen
-        if not freeze_vo:
-            self.map_vo_positions.append((pos_x, pos_y))
-        if (
-            self.map_show_vo_cb.isChecked()
-            and len(self.map_vo_positions) > 1
-            and not freeze_vo
-        ):
-            xs = [p[0] for p in self.map_vo_positions]
-            ys = [p[1] for p in self.map_vo_positions]
-            self.map_vo_curve.setData(xs, ys)
+            # VO path — only advance when not frozen
+            if not freeze_vo:
+                self.map_vo_positions.append((pos_x, pos_y))
+            if (
+                self.map_show_vo_cb.isChecked()
+                and len(self.map_vo_positions) > 1
+                and not freeze_vo
+            ):
+                xs = [p[0] for p in self.map_vo_positions]
+                ys = [p[1] for p in self.map_vo_positions]
+                self.map_vo_curve.setData(xs, ys)
 
         # Fused path
         if self.ekf_enabled_cb.isChecked():
@@ -1244,51 +1429,172 @@ class DataViewer(QMainWindow):
         # Current position marker (show fused if available, else VO)
         if self.ekf_enabled_cb.isChecked() and self.map_fused_positions:
             cx, cy = self.map_fused_positions[-1]
-        else:
-            cx, cy = pos_x, pos_y
-        self.map_current_marker.setData([cx], [cy])
-
-        # Depth point cloud projection — only for freshly computed frames
-        if self.map_show_pts_cb.isChecked() and is_fresh:
+            R_w = self.engine.ekf.get_rotation_matrix()
+        elif result is not None:
+            cx, cy = result.get("pos_x", 0.0), result.get("pos_y", 0.0)
             R_w = result.get("R_world")
-            if R_w is not None:
-                tracked_pts = result.get("tracked_pts", [])
-                new_world_pts = []
-                f = self.engine.vo.focal_length
-                cx_cam, cy_cam = self.engine.vo.center
-                pos = np.array([
+        else:
+            cx, cy = 0.0, 0.0
+            R_w = None
+        self.map_current_marker.setData([cx], [cy])
+        self._update_camera_fov(cx, cy, R_w)
+
+        # Depth point cloud projection
+        if not self.map_show_pts_cb.isChecked():
+            return
+
+        # Determine which mode: dense (all pixels) or sparse (tracked features)
+        use_dense = self.config.get("dense_point_cloud", False)
+
+        # Dense mode: project every Nth pixel (works even without VO)
+        # Sparse mode: only project tracked feature points (requires VO result)
+        if use_dense:
+            # Dense mode works on every frame, not just fresh VO frames
+            self._project_dense_points(depth, conf, conf_threshold)
+        elif is_fresh and result is not None:
+            # Sparse mode: only when VO produced a fresh result
+            self._project_tracked_points(result, depth, conf, conf_threshold)
+
+    def _get_projection_pose(self):
+        """Get the pose (rotation matrix and position) to use for point projection.
+
+        Returns:
+            (R_w, pos): rotation matrix (3x3) and position (3,) in world coordinates
+        """
+        use_ekf = self.config.get("use_ekf_pose_for_points", True)
+
+        if use_ekf and self.ekf_enabled_cb.isChecked():
+            # Use fused EKF pose (smoother, less drift)
+            R_w = self.engine.ekf.get_rotation_matrix()
+            pos = np.array(self.engine.ekf.get_position())
+        else:
+            # Fallback to VO pose from current frame's result
+            # This is set in _project_tracked_points or _project_dense_points
+            return None, None
+
+        return R_w, pos
+
+    def _project_dense_points(self, depth, conf, conf_threshold):
+        """Project all depth pixels to world coordinates (dense point cloud).
+
+        Uses configurable pixel skip for downsampling and applies constraints.
+        """
+        R_w, pos = self._get_projection_pose()
+        if R_w is None:
+            # EKF not available and no VO result for this frame
+            return
+
+        skip = self.config.get("point_cloud_pixel_skip", 4)
+        max_range_mm = 4000 if self.config.get("constrain_max_range", True) else 65535
+        constrain_front = self.config.get("constrain_to_front", True)
+
+        f = self.engine.vo.focal_length
+        cx_cam, cy_cam = self.engine.vo.center
+
+        new_pts = []
+        h, w = depth.shape
+
+        # Iterate over image with stride=skip for downsampling
+        for v in range(0, h, skip):
+            for u in range(0, w, skip):
+                d_mm = float(depth[v, u])
+
+                # Constraint: valid depth within sensor range
+                if d_mm <= 0 or d_mm > max_range_mm:
+                    continue
+
+                # Constraint: confidence threshold
+                if conf[v, u] < conf_threshold:
+                    continue
+
+                # Unproject to camera coordinates
+                d_m = d_mm / 1000.0
+                X_cam = (u - cx_cam) / f * d_m
+                Y_cam = (v - cy_cam) / f * d_m
+                Z_cam = d_m
+
+                # Constraint: must be in front of camera
+                if constrain_front and Z_cam <= 0.1:
+                    continue
+
+                # Transform to world coordinates
+                P_world = R_w @ np.array([X_cam, Y_cam, Z_cam]) + pos
+                new_pts.append((float(P_world[0]), float(P_world[1])))
+
+        # Add to point cloud with size limit
+        self._add_points_to_cloud(new_pts)
+
+    def _project_tracked_points(self, result, depth, conf, conf_threshold):
+        """Project only tracked feature points (sparse point cloud).
+
+        Original behavior, but now uses EKF pose when configured.
+        """
+        use_ekf = self.config.get("use_ekf_pose_for_points", True)
+
+        if use_ekf and self.ekf_enabled_cb.isChecked():
+            # Use fused EKF pose
+            R_w = self.engine.ekf.get_rotation_matrix()
+            pos = np.array(self.engine.ekf.get_position())
+        else:
+            # Use VO pose from result
+            R_w = result.get("R_world")
+            if R_w is None:
+                return
+            pos = np.array(
+                [
                     result.get("pos_x", 0.0),
                     result.get("pos_y", 0.0),
-                    result.get("pos_z", 0.0)
-                ])
-                for pt in tracked_pts:
-                    u, v = pt[0], pt[1]
-                    iu, iv = int(round(u)), int(round(v))
-                    if not (0 <= iu < depth.shape[1] and 0 <= iv < depth.shape[0]):
-                        continue
-                    if conf[iv, iu] < conf_threshold:
-                        continue
-                    d_mm = float(depth[iv, iu])
-                    if d_mm <= 0:
-                        continue
-                    d_m = d_mm / 1000.0
-                    # Unproject to camera frame
-                    X_cam = (u - cx_cam) / f * d_m
-                    Y_cam = (v - cy_cam) / f * d_m
-                    Z_cam = d_m
-                    # Transform to world frame
-                    P_world = R_w @ np.array([X_cam, Y_cam, Z_cam]) + pos
-                    new_world_pts.append((float(P_world[0]), float(P_world[1])))
+                    result.get("pos_z", 0.0),
+                ]
+            )
 
-                self.map_depth_points.extend(new_world_pts)
-                max_pts = self.map_max_pts_spin.value()
-                if len(self.map_depth_points) > max_pts:
-                    self.map_depth_points = self.map_depth_points[-max_pts:]
+        max_range_mm = 4000 if self.config.get("constrain_max_range", True) else 65535
+        constrain_front = self.config.get("constrain_to_front", True)
 
-                if self.map_depth_points:
-                    dxs = [p[0] for p in self.map_depth_points]
-                    dys = [p[1] for p in self.map_depth_points]
-                    self.map_depth_scatter.setData(dxs, dys)
+        f = self.engine.vo.focal_length
+        cx_cam, cy_cam = self.engine.vo.center
+
+        tracked_pts = result.get("tracked_pts", [])
+        new_pts = []
+
+        for pt in tracked_pts:
+            u, v = pt[0], pt[1]
+            iu, iv = int(round(u)), int(round(v))
+            if not (0 <= iu < depth.shape[1] and 0 <= iv < depth.shape[0]):
+                continue
+            if conf[iv, iu] < conf_threshold:
+                continue
+
+            d_mm = float(depth[iv, iu])
+            # Constraint: valid depth within sensor range
+            if d_mm <= 0 or d_mm > max_range_mm:
+                continue
+
+            d_m = d_mm / 1000.0
+            X_cam = (u - cx_cam) / f * d_m
+            Y_cam = (v - cy_cam) / f * d_m
+            Z_cam = d_m
+
+            # Constraint: must be in front of camera
+            if constrain_front and Z_cam <= 0.1:
+                continue
+
+            P_world = R_w @ np.array([X_cam, Y_cam, Z_cam]) + pos
+            new_pts.append((float(P_world[0]), float(P_world[1])))
+
+        self._add_points_to_cloud(new_pts)
+
+    def _add_points_to_cloud(self, new_pts):
+        """Add new points to the point cloud with size limit."""
+        self.map_depth_points.extend(new_pts)
+        max_pts = self.map_max_pts_spin.value()
+        if len(self.map_depth_points) > max_pts:
+            self.map_depth_points = self.map_depth_points[-max_pts:]
+
+        if self.map_depth_points:
+            dxs = [p[0] for p in self.map_depth_points]
+            dys = [p[1] for p in self.map_depth_points]
+            self.map_depth_scatter.setData(dxs, dys)
 
     def _on_range_changed(self):
         min_idx, max_idx = self.range_slider.value()
@@ -1387,6 +1693,24 @@ class DataViewer(QMainWindow):
         self.engine.update_config(self.config)
         self._recompute_vo()
 
+    def _on_camera_params_changed(self):
+        """Handle changes to camera focal length and sensor size."""
+        self.config["focal_length_mm"] = self.focal_spin.value()
+        self.config["sensor_size"] = self.sensor_combo.currentText()
+        self._save_config()
+        # Update VO camera setup
+        self.engine.vo._setup_camera()
+        # Must recompute VO since projection changes
+        self._recompute_vo()
+
+    def _on_max_range_changed(self, value):
+        """Handle changes to max range (mm)."""
+        self.config["max_range_mm"] = value
+        self._save_config()
+        # Clear point cloud since max range affects filtering
+        self.map_depth_points.clear()
+        self.update_display()
+
     def _update_clahe_params(self):
         enabled = self.clahe_cb.isChecked()
         self.clahe_clip_spin.setEnabled(enabled)
@@ -1404,17 +1728,17 @@ class DataViewer(QMainWindow):
         frames_dir = self.session_dir / "frames"
         if not frames_dir.exists():
             return
-            
+
         num_frames = self.frame_loader.set_session(frames_dir)
         if num_frames == 0:
             return
-        
+
         # We need a reference to at least one frame to get timestamps if we don't have IMU
         # but let's assume we can at least get metadata from the loader
         first_frame = self.frame_loader.get_frame(0)
         if first_frame is None:
             return
-        
+
         # Get all timestamps for IMU interpolation (this is still a bit heavy but much less than full frames)
         # Actually, let's just read the timestamps from the filenames or metadata if possible
         # For now, let's just load the timestamps only.
@@ -1422,7 +1746,7 @@ class DataViewer(QMainWindow):
         frame_ts = []
         for f in frame_files:
             # We can use np.load with mmap_mode to just read the timestamp without loading the whole depth/conf
-            with np.load(f, mmap_mode='r') as data:
+            with np.load(f, mmap_mode="r") as data:
                 frame_ts.append(data["timestamp_ns"])
 
         imu_path = self.session_dir / "imu_data.csv"
@@ -1454,7 +1778,7 @@ class DataViewer(QMainWindow):
 
         # Reset map and denoised state
         self._clear_map()
-        
+
         max_frame = num_frames - 1
         self.slider.setMaximum(max_frame)
         self.range_slider.setRange(0, max_frame)
@@ -1671,7 +1995,11 @@ class DataViewer(QMainWindow):
                 continue
             x_slice = list(range(min_idx, min_idx + len(data_slice)))
             data_arr = np.array(data_slice)
-            max_val = np.abs(data_arr).max() if data_arr.size > 0 and np.abs(data_arr).max() != 0 else 1
+            max_val = (
+                np.abs(data_arr).max()
+                if data_arr.size > 0 and np.abs(data_arr).max() != 0
+                else 1
+            )
             normalized = data_arr / max_val * 100
             curve.setData(x_slice, normalized)
 
@@ -1690,13 +2018,13 @@ class DataViewer(QMainWindow):
         if jumped:
             self.engine.reset(self.imu_data)
             self._clear_paths()
-            
+
         self.last_displayed_frame = self.current_frame
 
         frame = self.frame_loader.get_frame(self.current_frame)
         if frame is None:
             return
-            
+
         view_mode = self.view_combo.currentText()
         conf_threshold = self.config.get("conf_threshold", 10)
 
@@ -1707,19 +2035,33 @@ class DataViewer(QMainWindow):
         was_cached = self.vo_results[self.current_frame] is not None
 
         # Prepare IMU data for engine
-        gyro = np.array([
-            self.imu_interpolated["gyro_x"][self.current_frame],
-            self.imu_interpolated["gyro_y"][self.current_frame],
-            self.imu_interpolated["gyro_z"][self.current_frame]
-        ])
-        accel = np.array([
-            self.imu_interpolated["acc_x"][self.current_frame],
-            self.imu_interpolated["acc_y"][self.current_frame],
-            self.imu_interpolated["acc_z"][self.current_frame]
-        ])
+        gyro = np.array(
+            [
+                self.imu_interpolated["gyro_x"][self.current_frame],
+                self.imu_interpolated["gyro_y"][self.current_frame],
+                self.imu_interpolated["gyro_z"][self.current_frame],
+            ]
+        )
+        accel = np.array(
+            [
+                self.imu_interpolated["acc_x"][self.current_frame],
+                self.imu_interpolated["acc_y"][self.current_frame],
+                self.imu_interpolated["acc_z"][self.current_frame],
+            ]
+        )
         if self.imu_filter_enabled:
-            gyro = np.array([self.imu_filtered[k][self.current_frame] for k in ["gyro_x", "gyro_y", "gyro_z"]])
-            accel = np.array([self.imu_filtered[k][self.current_frame] for k in ["acc_x", "acc_y", "acc_z"]])
+            gyro = np.array(
+                [
+                    self.imu_filtered[k][self.current_frame]
+                    for k in ["gyro_x", "gyro_y", "gyro_z"]
+                ]
+            )
+            accel = np.array(
+                [
+                    self.imu_filtered[k][self.current_frame]
+                    for k in ["acc_x", "acc_y", "acc_z"]
+                ]
+            )
 
         prev_ts = None
         if self.current_frame > 0:
@@ -1730,33 +2072,51 @@ class DataViewer(QMainWindow):
 
         if self.vo_enabled_cb.isChecked() and not was_cached:
             vo_res, fused_pos, denoised = self.engine.process_frame(
-                depth, conf, ts, gyro, accel, dt,
+                depth,
+                conf,
+                ts,
+                gyro,
+                accel,
+                dt,
                 use_denoised=self.vo_use_denoised_cb.isChecked(),
-                denoise_alpha=self.denoise_alpha
+                denoise_alpha=self.denoise_alpha,
             )
             self.vo_results[self.current_frame] = vo_res
             self.current_depth = denoised if view_mode == "denoised" else depth
             self.current_conf = conf
 
-            for key in ["tracked", "rejected", "ratio", "pos_x", "pos_y", "pos_z", "mean_depth", "mean_conf", "fps", "vo_score"]:
+            for key in [
+                "tracked",
+                "rejected",
+                "ratio",
+                "pos_x",
+                "pos_y",
+                "pos_z",
+                "mean_depth",
+                "mean_conf",
+                "fps",
+                "vo_score",
+            ]:
                 self.graph_data[key][self.current_frame] = vo_res.get(key, 0)
-            
+
             self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
             self.graph_data["pos_fused_y"][self.current_frame] = fused_pos[1]
             self.graph_data["pos_fused_z"][self.current_frame] = fused_pos[2]
-            
-            result = vo_res 
+
+            result = vo_res
             display_depth = self.current_depth
         else:
             result = self.vo_results[self.current_frame]
             self.current_conf = conf
             if result and self.ekf_enabled_cb.isChecked():
                 vo_pos = [result["pos_x"], result["pos_y"], result["pos_z"]]
-                fused_pos = self.engine.update_ekf(gyro, accel, dt, vo_pos, result.get("vo_score", 0.0))
+                fused_pos = self.engine.update_ekf(
+                    gyro, accel, dt, vo_pos, result.get("vo_score", 0.0)
+                )
                 self.graph_data["pos_fused_x"][self.current_frame] = fused_pos[0]
                 self.graph_data["pos_fused_y"][self.current_frame] = fused_pos[1]
                 self.graph_data["pos_fused_z"][self.current_frame] = fused_pos[2]
-            
+
             # If we are in denoised mode but result was cached, we ideally want to show denoised depth.
             # However, denoising is temporal and stateful. Since we are in 'else', we are either:
             # 1. Sequential playback but VO was cached (this happens if user processed range before).
@@ -1764,7 +2124,9 @@ class DataViewer(QMainWindow):
             # If it's sequential, we can still compute denoised depth.
             if view_mode == "denoised" and self.ekf_enabled_cb.isChecked():
                 # Re-run denoising only to keep state consistent for display
-                denoised = self.engine.compute_denoised(depth, conf, conf_threshold, self.denoise_alpha)
+                denoised = self.engine.compute_denoised(
+                    depth, conf, conf_threshold, self.denoise_alpha
+                )
                 self.current_depth = denoised
                 display_depth = denoised
             else:
@@ -1876,7 +2238,6 @@ class DataViewer(QMainWindow):
 
         self._update_graph()
 
-
     def _on_process_range_clicked(self):
         if not self.session_dir:
             return
@@ -1893,27 +2254,23 @@ class DataViewer(QMainWindow):
 
         self.process_thread = QThread()
         self.process_worker = ProcessingWorker(
-            worker_engine,
-            self.frame_loader,
-            self.imu_interpolated,
-            min_idx,
-            max_idx
+            worker_engine, self.frame_loader, self.imu_interpolated, min_idx, max_idx
         )
         self.process_worker.moveToThread(self.process_thread)
-        
+
         self.process_thread.started.connect(self.process_worker.run)
         self.process_worker.progress.connect(self.progress_bar.setValue)
         self.process_worker.finished.connect(self._on_processing_finished)
         self.process_worker.finished.connect(self.process_thread.quit)
         self.process_worker.finished.connect(self.process_worker.deleteLater)
         self.process_thread.finished.connect(self.process_thread.deleteLater)
-        
+
         self.process_thread.start()
 
     def _on_processing_finished(self, results):
         self.process_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
-        
+
         min_idx, _ = self.range_slider.value()
         for i, res in enumerate(results):
             frame_idx = min_idx + i
@@ -1921,9 +2278,20 @@ class DataViewer(QMainWindow):
                 vo_res, fused_pos = res
                 self.vo_results[frame_idx] = vo_res
                 if vo_res:
-                    for key in ["tracked", "rejected", "ratio", "pos_x", "pos_y", "pos_z", "mean_depth", "mean_conf", "fps", "vo_score"]:
+                    for key in [
+                        "tracked",
+                        "rejected",
+                        "ratio",
+                        "pos_x",
+                        "pos_y",
+                        "pos_z",
+                        "mean_depth",
+                        "mean_conf",
+                        "fps",
+                        "vo_score",
+                    ]:
                         self.graph_data[key][frame_idx] = vo_res.get(key, 0)
-                
+
                 self.graph_data["pos_fused_x"][frame_idx] = fused_pos[0]
                 self.graph_data["pos_fused_y"][frame_idx] = fused_pos[1]
                 self.graph_data["pos_fused_z"][frame_idx] = fused_pos[2]

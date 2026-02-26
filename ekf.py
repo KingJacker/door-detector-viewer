@@ -14,7 +14,9 @@ class ExtendedKalmanFilter:
         self.P = np.eye(6) * 0.1
 
         # Orientation quaternion [w, x, y, z] (not part of state vector)
-        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        # Initial: camera Z (forward) -> world Y (forward), -90° around X
+        # q = [cos(-45°), sin(-45°), 0, 0] = [√2/2, -√2/2, 0, 0]
+        self.q = np.array([0.70710678, -0.70710678, 0.0, 0.0])
 
         self.up_direction = np.array([0.0, 0.0, 1.0])
 
@@ -27,6 +29,7 @@ class ExtendedKalmanFilter:
 
         # Wheelchair motion model constraints
         self.max_speed = 2.0  # m/s — 0 = disabled
+        self.max_rotation_speed = 1.5  # rad/s — 0 = disabled
         self.lateral_damping = 0.1  # 0 = no lateral motion, 1 = unconstrained
 
         self.prev_timestamp = None
@@ -38,7 +41,8 @@ class ExtendedKalmanFilter:
     def reset(self):
         self.state = np.zeros(6)
         self.P = np.eye(6) * 0.1
-        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        # Reset to initial orientation: camera Z (forward) -> world Y (forward)
+        self.q = np.array([0.70710678, -0.70710678, 0.0, 0.0])
         self.prev_timestamp = None
         self.last_dt = 0.033
         self.last_gyro = np.zeros(3)
@@ -121,6 +125,12 @@ class ExtendedKalmanFilter:
     def predict(self, gyro, accel, dt):
         if dt <= 0 or dt > 0.5:
             return
+
+        # Clamp angular velocity to max rotation speed
+        if self.max_rotation_speed > 0:
+            gyro_norm = np.linalg.norm(gyro)
+            if gyro_norm > self.max_rotation_speed:
+                gyro = gyro * (self.max_rotation_speed / gyro_norm)
 
         # --- Quaternion integration (q = [w, x, y, z]) ---
         q = self.q
