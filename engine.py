@@ -115,6 +115,7 @@ class ProcessingEngine:
         # 1. IMU conversion and remapping
         gyro_rads = np.deg2rad(gyro_raw)
         accel_ms2 = accel_raw * 9.81
+
         if self.config.get("gyro_axis_map", "ZYX") == "ZYX":
             gyro_rads = gyro_rads[[2, 1, 0]]
 

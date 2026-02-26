@@ -38,13 +38,23 @@ class VisualOdometry:
         self._frame_times = []
 
     def _setup_camera(self):
-        f_mm = self.config.get("focal_length_mm", 3.4)
-        # Handle cases where sensor_size might be missing
-        sensor_size = self.config.get("sensor_size", "1/6")
-        sensor_width = self._sensor_width_mm(sensor_size)
-
-        self.focal_length = (f_mm / sensor_width) * self.width
-        self.center = (self.width / 2.0, self.height / 2.0)
+        if self.config.get("use_fov_mode", False):
+            # FOV mode: use resolution and FOV to compute focal length
+            self.width = self.config.get("resolution_x", 240)
+            self.height = self.config.get("resolution_y", 180)
+            fov_x = np.radians(self.config.get("fov_x_deg", 70.0))
+            # focal_length in pixels = (width / 2) / tan(FOV / 2)
+            self.focal_length = (self.width / 2.0) / np.tan(fov_x / 2.0)
+            self.center = (self.width / 2.0, self.height / 2.0)
+        else:
+            # Physical mode: use focal length (mm) and sensor size
+            f_mm = self.config.get("focal_length_mm", 3.4)
+            sensor_size = self.config.get("sensor_size", "1/6")
+            sensor_width = self._sensor_width_mm(sensor_size)
+            # Note: width and height remain at default (240x180) or should we get them from config too?
+            # For now, keep current resolution in physical mode
+            self.focal_length = (f_mm / sensor_width) * self.width
+            self.center = (self.width / 2.0, self.height / 2.0)
 
     def _sensor_diagonal_mm(self, sensor_size):
         sizes = {

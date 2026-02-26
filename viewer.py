@@ -203,6 +203,13 @@ class DataViewer(QMainWindow):
             "constrain_to_front": True,
             "max_range_mm": 4000,
             "camera_fov_deg": 70,
+            # Camera parameter modes
+            "use_fov_mode": False,
+            "fov_x_deg": 70,
+            "fov_y_deg": 55,
+            "resolution_x": 240,
+            "resolution_y": 180,
+            "min_depth_mm": 100,
             # Graph series visibility
             "graph_series": {
                 "tracked": True,
@@ -295,6 +302,93 @@ class DataViewer(QMainWindow):
         )
         self.max_range_spin.valueChanged.connect(self._on_max_range_changed)
         camera_layout.addRow("Max range:", self.max_range_spin)
+
+        # Min depth / dead zone (configurable)
+        self.min_depth_spin = QSpinBox()
+        self.min_depth_spin.setRange(0, 1000)
+        self.min_depth_spin.setSingleStep(10)
+        self.min_depth_spin.setValue(self.config.get("min_depth_mm", 100))
+        self.min_depth_spin.setSuffix(" mm")
+        self.min_depth_spin.setToolTip(
+            "Minimum depth threshold for point cloud projection.\n"
+            "Points closer than this are ignored (shown as red dead zone in FOV cone)."
+        )
+        self.min_depth_spin.valueChanged.connect(self._on_min_depth_changed)
+        camera_layout.addRow("Min depth:", self.min_depth_spin)
+
+        # Mode toggle
+        self.use_fov_mode_cb = QCheckBox("Use FOV mode")
+        self.use_fov_mode_cb.setChecked(self.config.get("use_fov_mode", False))
+        self.use_fov_mode_cb.setToolTip(
+            "Toggle between physical camera params (focal length + sensor) "
+            "and direct FOV + resolution input."
+        )
+        self.use_fov_mode_cb.toggled.connect(self._on_camera_mode_toggled)
+        camera_layout.addRow(self.use_fov_mode_cb)
+
+        # Physical mode widgets container
+        self.physical_mode_widget = QWidget()
+        physical_layout = QFormLayout(self.physical_mode_widget)
+        physical_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Show computed FOV in physical mode
+        self.computed_fov_x_label = QLabel("--")
+        self.computed_fov_y_label = QLabel("--")
+        physical_layout.addRow("FOV X:", self.computed_fov_x_label)
+        physical_layout.addRow("FOV Y:", self.computed_fov_y_label)
+        camera_layout.addRow(self.physical_mode_widget)
+
+        # FOV mode widgets container
+        self.fov_mode_widget = QWidget()
+        fov_layout = QFormLayout(self.fov_mode_widget)
+        fov_layout.setContentsMargins(0, 0, 0, 0)
+
+        # FOV X
+        self.fov_x_spin = QDoubleSpinBox()
+        self.fov_x_spin.setRange(10.0, 180.0)
+        self.fov_x_spin.setSingleStep(1.0)
+        self.fov_x_spin.setDecimals(1)
+        self.fov_x_spin.setValue(self.config.get("fov_x_deg", 70.0))
+        self.fov_x_spin.setSuffix(" °")
+        self.fov_x_spin.valueChanged.connect(self._on_fov_params_changed)
+        fov_layout.addRow("FOV X:", self.fov_x_spin)
+
+        # FOV Y
+        self.fov_y_spin = QDoubleSpinBox()
+        self.fov_y_spin.setRange(10.0, 180.0)
+        self.fov_y_spin.setSingleStep(1.0)
+        self.fov_y_spin.setDecimals(1)
+        self.fov_y_spin.setValue(self.config.get("fov_y_deg", 55.0))
+        self.fov_y_spin.setSuffix(" °")
+        self.fov_y_spin.valueChanged.connect(self._on_fov_params_changed)
+        fov_layout.addRow("FOV Y:", self.fov_y_spin)
+
+        # Resolution X
+        self.res_x_spin = QSpinBox()
+        self.res_x_spin.setRange(100, 1000)
+        self.res_x_spin.setSingleStep(10)
+        self.res_x_spin.setValue(self.config.get("resolution_x", 240))
+        self.res_x_spin.setSuffix(" px")
+        self.res_x_spin.valueChanged.connect(self._on_fov_params_changed)
+        fov_layout.addRow("Res X:", self.res_x_spin)
+
+        # Resolution Y
+        self.res_y_spin = QSpinBox()
+        self.res_y_spin.setRange(100, 1000)
+        self.res_y_spin.setSingleStep(10)
+        self.res_y_spin.setValue(self.config.get("resolution_y", 180))
+        self.res_y_spin.setSuffix(" px")
+        self.res_y_spin.valueChanged.connect(self._on_fov_params_changed)
+        fov_layout.addRow("Res Y:", self.res_y_spin)
+
+        # Show computed focal length in FOV mode
+        self.computed_focal_label = QLabel("--")
+        fov_layout.addRow("Focal (px):", self.computed_focal_label)
+
+        camera_layout.addRow(self.fov_mode_widget)
+
+        # Set initial visibility
+        self._update_camera_mode_visibility()
 
         layout.addWidget(camera_group)
 
@@ -424,12 +518,19 @@ class DataViewer(QMainWindow):
         )
         self.map_widget.addItem(self.map_depth_scatter)
 
-        # Camera FOV cone (70° default, gray with opacity)
+        # Camera FOV cone (outer - max range, gray with opacity)
         self.map_camera_fov = pg.PlotDataItem(
             pen=pg.mkPen((128, 128, 128, 100), width=1),
             fill=pg.mkBrush((128, 128, 128, 50)),
         )
         self.map_widget.addItem(self.map_camera_fov)
+
+        # Camera dead zone cone (inner - min depth, red with opacity)
+        self.map_dead_zone = pg.PlotDataItem(
+            pen=pg.mkPen((255, 0, 0, 100), width=1),
+            fill=pg.mkBrush((255, 0, 0, 50)),
+        )
+        self.map_widget.addItem(self.map_dead_zone)
 
         map_layout.addWidget(self.map_widget)
 
@@ -1121,7 +1222,7 @@ class DataViewer(QMainWindow):
 
     def _on_ekf_param_changed(self, param, value):
         if param == "process_noise":
-            self.ekf.process_noise = value
+            self.engine.ekf.process_noise = value
             self.config["ekf_process_noise"] = value
             self.ekf_process_noise_slider.blockSignals(True)
             self.ekf_process_noise_slider.setValue(int(value * 100))
@@ -1130,7 +1231,7 @@ class DataViewer(QMainWindow):
             self.ekf_process_noise_spin.setValue(value)
             self.ekf_process_noise_spin.blockSignals(False)
         elif param == "measure_noise":
-            self.ekf.measurement_noise = value
+            self.engine.ekf.measurement_noise = value
             self.config["ekf_measure_noise"] = value
             self.ekf_measure_noise_slider.blockSignals(True)
             self.ekf_measure_noise_slider.setValue(int(value * 10))
@@ -1327,6 +1428,7 @@ class DataViewer(QMainWindow):
         self.map_depth_points.clear()
         self.map_depth_scatter.setData([], [])
         self.map_camera_fov.setData([], [])
+        self.map_dead_zone.setData([], [])
 
     def _update_camera_fov(self, cx, cy, R_w=None):
         """Update the camera FOV cone visualization.
@@ -1340,7 +1442,8 @@ class DataViewer(QMainWindow):
             R_w: Camera-to-world rotation matrix (3x3). If None, assumes
                  camera points along +Y (forward in world frame).
         """
-        fov_deg = self.config.get("camera_fov_deg", 70.0)
+        # Use fov_x_deg for horizontal FOV (works in both physical and FOV modes)
+        fov_deg = self.config.get("fov_x_deg", 70.0)
         max_range_m = self.config.get("max_range_mm", 4000) / 1000.0
 
         # Get camera forward direction in world X-Y plane
@@ -1387,6 +1490,17 @@ class DataViewer(QMainWindow):
 
         self.map_camera_fov.setData(xs, ys)
 
+        # Draw dead zone cone (red, from camera to min_depth)
+        min_depth_m = self.config.get("min_depth_mm", 100) / 1000.0
+        dz_left_tip_x = cx + left_fx * min_depth_m
+        dz_left_tip_y = cy + left_fy * min_depth_m
+        dz_right_tip_x = cx + right_fx * min_depth_m
+        dz_right_tip_y = cy + right_fy * min_depth_m
+
+        dz_xs = [cx, dz_left_tip_x, dz_right_tip_x, cx]
+        dz_ys = [cy, dz_left_tip_y, dz_right_tip_y, cy]
+        self.map_dead_zone.setData(dz_xs, dz_ys)
+
     def _update_map(
         self, result, depth, conf, conf_threshold, is_fresh=True, freeze_vo=False
     ):
@@ -1419,7 +1533,7 @@ class DataViewer(QMainWindow):
 
         # Fused path
         if self.ekf_enabled_cb.isChecked():
-            fx, fy, _ = self.engine.ekf.get_position()
+            fx, fy, fz = self.engine.ekf.get_position()
             self.map_fused_positions.append((fx, fy))
             if self.map_show_fused_cb.isChecked() and len(self.map_fused_positions) > 1:
                 fxs = [p[0] for p in self.map_fused_positions]
@@ -1700,6 +1814,29 @@ class DataViewer(QMainWindow):
         self._save_config()
         # Update VO camera setup
         self.engine.vo._setup_camera()
+        # Update computed FOV display and sync fov_x_deg
+        self._update_computed_fov()
+        # Sync fov_x_deg from computed value for cone visualization
+        try:
+            f_mm = self.focal_spin.value()
+            sensor_size = self.sensor_combo.currentText()
+            sizes = {
+                "1/6": 3.0,
+                "1/4": 4.0,
+                "1/3": 6.0,
+                "1/2.3": 7.0,
+                "1/2": 8.0,
+                "2/3": 11.0,
+                "1": 16.0,
+            }
+            diag_mm = sizes.get(sensor_size, 3.0)
+            aspect = 4 / 3
+            sensor_width = diag_mm / np.sqrt(1 + aspect**2)
+            fov_x = 2 * np.degrees(np.arctan(sensor_width / (2 * f_mm)))
+            self.config["fov_x_deg"] = fov_x
+            self._save_config()
+        except:
+            pass
         # Must recompute VO since projection changes
         self._recompute_vo()
 
@@ -1710,6 +1847,90 @@ class DataViewer(QMainWindow):
         # Clear point cloud since max range affects filtering
         self.map_depth_points.clear()
         self.update_display()
+
+    def _on_min_depth_changed(self, value):
+        """Handle changes to min depth/dead zone (mm)."""
+        self.config["min_depth_mm"] = value
+        self._save_config()
+        # Clear point cloud since min depth affects filtering
+        self.map_depth_points.clear()
+        self.update_display()
+
+    def _on_camera_mode_toggled(self, checked):
+        """Handle toggle between physical and FOV camera modes."""
+        self.config["use_fov_mode"] = checked
+        self._save_config()
+        self._update_camera_mode_visibility()
+        # Update camera setup and recompute
+        self.engine.vo._setup_camera()
+        self._recompute_vo()
+
+    def _on_fov_params_changed(self):
+        """Handle changes to FOV mode parameters."""
+        self.config["fov_x_deg"] = self.fov_x_spin.value()
+        self.config["fov_y_deg"] = self.fov_y_spin.value()
+        self.config["resolution_x"] = self.res_x_spin.value()
+        self.config["resolution_y"] = self.res_y_spin.value()
+        self._save_config()
+        # Update VO camera setup
+        self.engine.vo._setup_camera()
+        # Update computed focal length display
+        self._update_computed_focal_length()
+        # Must recompute VO since projection changes
+        self._recompute_vo()
+
+    def _update_camera_mode_visibility(self):
+        """Update UI visibility based on camera mode."""
+        use_fov = self.use_fov_mode_cb.isChecked()
+        self.physical_mode_widget.setVisible(not use_fov)
+        self.fov_mode_widget.setVisible(use_fov)
+        # Update computed values display
+        if use_fov:
+            self._update_computed_focal_length()
+        else:
+            self._update_computed_fov()
+
+    def _update_computed_fov(self):
+        """Update the computed FOV labels in physical mode."""
+        try:
+            f_mm = self.focal_spin.value()
+            sensor_size = self.sensor_combo.currentText()
+            # Compute sensor dimensions
+            sizes = {
+                "1/6": 3.0,
+                "1/4": 4.0,
+                "1/3": 6.0,
+                "1/2.3": 7.0,
+                "1/2": 8.0,
+                "2/3": 11.0,
+                "1": 16.0,
+            }
+            diag_mm = sizes.get(sensor_size, 3.0)
+            aspect = 4 / 3
+            sensor_width = diag_mm / np.sqrt(1 + aspect**2)
+            sensor_height = sensor_width * aspect
+            # Compute FOV
+            fov_x = 2 * np.degrees(np.arctan(sensor_width / (2 * f_mm)))
+            fov_y = 2 * np.degrees(np.arctan(sensor_height / (2 * f_mm)))
+            self.computed_fov_x_label.setText(f"{fov_x:.1f}°")
+            self.computed_fov_y_label.setText(f"{fov_y:.1f}°")
+        except:
+            self.computed_fov_x_label.setText("--")
+            self.computed_fov_y_label.setText("--")
+
+    def _update_computed_focal_length(self):
+        """Update the computed focal length label in FOV mode."""
+        try:
+            fov_x = np.radians(self.fov_x_spin.value())
+            res_x = self.res_x_spin.value()
+            focal_px = (res_x / 2) / np.tan(fov_x / 2)
+            # Compute focal length in mm assuming 1/6" sensor (3mm diagonal)
+            # This is an approximation since we don't have physical sensor size in FOV mode
+            sensor_width_mm = 2.4  # Approximate for 1/6" sensor with 4:3 aspect
+            focal_mm = focal_px * (sensor_width_mm / res_x)
+            self.computed_focal_label.setText(f"{focal_px:.1f} px ({focal_mm:.1f} mm)")
+        except:
+            self.computed_focal_label.setText("--")
 
     def _update_clahe_params(self):
         enabled = self.clahe_cb.isChecked()
@@ -2049,6 +2270,7 @@ class DataViewer(QMainWindow):
                 self.imu_interpolated["acc_z"][self.current_frame],
             ]
         )
+
         if self.imu_filter_enabled:
             gyro = np.array(
                 [
@@ -2232,7 +2454,11 @@ class DataViewer(QMainWindow):
         for key, label in self.series_labels.items():
             if self.current_frame < len(self.graph_data.get(key, [])):
                 value = self.graph_data[key][self.current_frame]
-                label.setText(f"{value:.1f}")
+                # Show 2 decimal places for position values, 1 for others
+                if "pos" in key:
+                    label.setText(f"{value:.2f}")
+                else:
+                    label.setText(f"{value:.1f}")
             else:
                 label.setText("0.0")
 
