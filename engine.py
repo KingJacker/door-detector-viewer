@@ -161,6 +161,7 @@ class ProcessingEngine:
                 self.ekf.update(vo_pos, vo_score)
 
         fused_pos = self.ekf.get_position()
+        euler = self.ekf.get_euler_angles()
 
         # 4. Logging
         if self.log_file:
@@ -174,7 +175,7 @@ class ProcessingEngine:
                 f"{q[0]:.6f},{q[1]:.6f},{q[2]:.6f},{q[3]:.6f}\n"
             )
 
-        return fused_pos
+        return fused_pos, euler
 
     def process_frame(
         self,
@@ -206,6 +207,6 @@ class ProcessingEngine:
             vo_pos = [vo_result["pos_x"], vo_result["pos_y"], vo_result["pos_z"]]
             vo_score = vo_result.get("vo_score", 0.0)
 
-        fused_pos = self.update_ekf(gyro_raw, accel_raw, dt, vo_pos, vo_score, timestamp_ns)
+        fused_pos, euler = self.update_ekf(gyro_raw, accel_raw, dt, vo_pos, vo_score, timestamp_ns)
 
-        return vo_result, fused_pos, denoised
+        return vo_result, fused_pos, euler, denoised
